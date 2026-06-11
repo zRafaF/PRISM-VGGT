@@ -24,7 +24,7 @@ echo "[*] Weights downloaded."
 
 # 4. Install specific NVBLOX wheel
 echo "[*] Installing custom Nvblox tensor bindings..."
-UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu22-py3-none-linux_x86_64.whl
+uv pip install https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu22-py3-none-linux_x86_64.whl
 
 echo "=============================================="
 echo "✅ Setup Complete! To launch the UI, run:"
