@@ -142,11 +142,12 @@ class StreamingWindowEngine:
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
             
+            # --- 0. Sync Previous Background Tasks ---
             t0 = time.time()
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
                 self.tsdf_future = None
-            profiler["TSDF_Sync"] = time.time() - t0
+            profiler["TSDF_Thread_Sync"] = time.time() - t0
             
             # --- 1. Perception Extraction ---
             t1 = time.time()
@@ -161,6 +162,10 @@ class StreamingWindowEngine:
             mid_idx = self.window_size // 2
             floor_scale, floor_conf = estimate_metric_scale_from_floor(pts_list[mid_idx], target_camera_height=self.target_camera_height)
             
+            # Clamp floor scale defensively so anomalies don't explode the scene size and OOM Nvblox
+            if floor_scale is not None:
+                floor_scale = np.clip(floor_scale, 0.1, 5.0)
+
             if self.is_first_window:
                 if floor_scale is not None:
                     self.current_metric_scale = floor_scale
@@ -178,16 +183,13 @@ class StreamingWindowEngine:
                 clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
                 relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
                 self.current_metric_scale = (0.9 * relative_scale + 0.1 * floor_scale) if (floor_scale and floor_conf > 0.4) else relative_scale
+                
+            self.current_metric_scale = np.clip(self.current_metric_scale, 0.1, 5.0)
 
             metric_local_poses = []
             for p in poses:
-                # [THE FIX]: Invert the World-To-Camera extrinsics to Camera-To-World.
-                # This guarantees that the translation vector is the true camera origin.
-                try:
-                    mp = np.linalg.inv(p.copy())
-                except np.linalg.LinAlgError:
-                    mp = np.eye(4)
-                    
+                # REVERTED: PanoVGGT is already C2W. Extracting position without inverting fixes the spiderweb.
+                mp = p.copy()
                 mp[:3, 3] *= self.current_metric_scale 
                 metric_local_poses.append(mp)
                 
@@ -215,7 +217,6 @@ class StreamingWindowEngine:
                     self.processed_indices.append(i + j)
                     self.full_poses.append(global_pose)
                     
-                    # Distance checks removed. Every valid frame is now integrated.
                     tsdf_pose = global_pose.copy()
                     
                     # Flip OpenCV Y down to TSDF Up
@@ -247,7 +248,7 @@ class StreamingWindowEngine:
             # --- 3. Enqueue TSDF Background Mapping ---
             t3 = time.time()
             if len(batch_poses) > 0:
-                print(f"  > [TSDF] Sending {len(batch_poses)} Keyframes to C++ Background Mapper...")
+                print(f"  > [TSDF] Enqueuing {len(batch_poses)} frames. Map Scale Factor: {self.current_metric_scale:.2f}")
                 self.tsdf_future = self.tsdf_executor.submit(
                     self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
                 )
@@ -278,8 +279,16 @@ class StreamingWindowEngine:
             profiler["Meshing_&_Coloring"] = time.time() - t4
 
             pt_alloc, pt_res, sys_used, sys_total = self.vram_tracker.stop()
-            print("  --- GPU Memory (VRAM) ---")
-            print(f"    - PyTorch Peak Alloc : {pt_alloc:.2f} GB | True System VRAM: {sys_used:.2f} GB")
+            
+            print("  --- ⏱️ Process Timing (Seconds) ---")
+            for k, v in profiler.items():
+                print(f"    - {k:<20}: {v:.3f}s")
+            print(f"    = Total Submap Time   : {(time.time() - t_win_start):.3f}s")
+            
+            print("  --- 💾 GPU Memory (VRAM) ---")
+            print(f"    - PyTorch Peak Alloc  : {pt_alloc:.2f} GB")
+            print(f"    - System VRAM Usage   : {sys_used:.2f} GB / {sys_total:.2f} GB")
+            
             self.submap_count += 1
 
             yield_mesh = self.last_mesh if self.last_mesh else o3d.geometry.TriangleMesh()
@@ -290,16 +299,20 @@ class StreamingWindowEngine:
         if self.tsdf_future is not None:
             self.tsdf_future.result()
 
-        print("[Engine] Extracting Unified Global Mesh...")
+        print("\n==========================================")
+        print(f"[Engine] Sequence Complete ({(time.time() - t_seq_start):.2f}s). Extracting Unified Global Mesh...")
         final_mesh = self.tsdf.extract_mesh()
         final_pcd = o3d.geometry.PointCloud()
         
         if final_mesh is not None and len(final_mesh.vertices) > 0:
             final_mesh.compute_vertex_normals()
+            t_mesh_start = time.time()
             final_colors = self._apply_pytorch_colors(
                 np.asarray(final_mesh.vertices), np.asarray(final_mesh.vertex_normals),
                 self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
             )
+            print(f"  > Final Global Map Colored in {(time.time() - t_mesh_start):.2f}s")
+            
             final_mesh.vertex_colors = o3d.utility.Vector3dVector(final_colors)
             
             valid_color_mask = final_colors.sum(axis=1) > 0.0
