@@ -11,14 +11,13 @@ from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
 class StreamingWindowEngine:
-    def __init__(self, perception: BasePerceptionExtractor, voxel_size=0.02, max_depth=4.5, keyframe_dist_m=0.10, device="cuda"):
+    def __init__(self, perception: BasePerceptionExtractor, voxel_size=0.02, max_depth=4.5, target_camera_height=1.5, device="cuda"):
         self.perception = perception
         self.device = device
         
         self.max_depth = max_depth
         self.voxel_size = voxel_size
-        self.min_translation_m = keyframe_dist_m
-        self.target_camera_height = 1.7 
+        self.target_camera_height = target_camera_height 
         
         self.vram_tracker = VRAMProfiler()
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
@@ -54,7 +53,6 @@ class StreamingWindowEngine:
         self.submap_count = 0
         self.is_first_window = True
         self.current_metric_scale = 1.0
-        self.last_integrated_position = None
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         for j in range(len(poses)):
@@ -111,7 +109,6 @@ class StreamingWindowEngine:
             
             valid_condition = (dist > 0.1) & (sampled_masks > 0.5) & is_visible & (dot_prod > 0) & (sampled_colors.sum(dim=1) > 0.15)
             
-            # [THE FIX]: Multiply by v_norm directly without the erroneous squeeze call
             score = torch.where(
                 valid_condition, 
                 (dot_prod * torch.cos(v_norm * (torch.pi / 2.0))) / (dist**2 + 1e-6), 
@@ -127,21 +124,20 @@ class StreamingWindowEngine:
         return final_colors.cpu().numpy()
 
     def process_sequence(self, frames, masks, window_size=16, overlap=4):
-        """
-        Processes a sequence using a sliding window approach.
-        Yields intermediate geometry.
-        """
+        self.window_size = window_size
+        self.overlap = overlap
         self.reset()
+        
         num_frames = len(frames)
         t_seq_start = time.time()
         
-        for i in range(0, num_frames - window_size + 1, window_size - overlap):
+        for i in range(0, num_frames - self.window_size + 1, self.window_size - self.overlap):
             self.vram_tracker.start()
             t_win_start = time.time()
             profiler = {}
 
-            window_frames = frames[i : i + window_size]
-            window_masks = masks[i : i + window_size]
+            window_frames = frames[i : i + self.window_size]
+            window_masks = masks[i : i + self.window_size]
             
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
@@ -152,7 +148,7 @@ class StreamingWindowEngine:
                 self.tsdf_future = None
             profiler["TSDF_Sync"] = time.time() - t0
             
-            # --- 1. Perception Extraction (Decoupled) ---
+            # --- 1. Perception Extraction ---
             t1 = time.time()
             preds = self.perception.process_sequence(window_frames)
             torch.cuda.synchronize()  
@@ -162,7 +158,7 @@ class StreamingWindowEngine:
             
             # --- 2. Alignment & Scale Correction ---
             t2 = time.time()
-            mid_idx = window_size // 2
+            mid_idx = self.window_size // 2
             floor_scale, floor_conf = estimate_metric_scale_from_floor(pts_list[mid_idx], target_camera_height=self.target_camera_height)
             
             if self.is_first_window:
@@ -185,7 +181,13 @@ class StreamingWindowEngine:
 
             metric_local_poses = []
             for p in poses:
-                mp = p.copy()
+                # [THE FIX]: Invert the World-To-Camera extrinsics to Camera-To-World.
+                # This guarantees that the translation vector is the true camera origin.
+                try:
+                    mp = np.linalg.inv(p.copy())
+                except np.linalg.LinAlgError:
+                    mp = np.eye(4)
+                    
                 mp[:3, 3] *= self.current_metric_scale 
                 metric_local_poses.append(mp)
                 
@@ -195,16 +197,16 @@ class StreamingWindowEngine:
             anchor_pose = np.eye(4)
             if not self.is_first_window:
                 R_align, t_align = register_camera_poses_kabsch(
-                    np.stack(canonical_poses[:overlap]), 
+                    np.stack(canonical_poses[:self.overlap]), 
                     np.stack(self.prev_overlap_global_poses), 
                     scale=1.0
                 )
                 anchor_pose[:3, :3], anchor_pose[:3, 3] = R_align, t_align
                 
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
-            start_idx = 0 if self.is_first_window else overlap
+            start_idx = 0 if self.is_first_window else self.overlap
             
-            for j in range(window_size):
+            for j in range(self.window_size):
                 global_pose = anchor_pose @ canonical_poses[j]
                 
                 if j >= start_idx:
@@ -213,33 +215,32 @@ class StreamingWindowEngine:
                     self.processed_indices.append(i + j)
                     self.full_poses.append(global_pose)
                     
-                    if self.last_integrated_position is None or np.linalg.norm(current_pos - self.last_integrated_position) >= self.min_translation_m:
-                        self.last_integrated_position = current_pos.copy()
-                        tsdf_pose = global_pose.copy()
-                        
-                        # Flip OpenCV Y down to TSDF Up
-                        if tsdf_pose[1, 1] < 0:
-                            tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-
-                        scaled_pts = pts_list[j] * self.current_metric_scale
-                        depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
-                        
-                        batch_depths.append(depth_map)
-                        batch_rgbs.append(window_frames[j])
-                        batch_masks.append(window_masks[j])
-                        batch_poses.append(tsdf_pose) 
-                        
-                        self.kf_depths.append(depth_map)
-                        self.kf_rgbs.append(window_frames[j])
-                        self.kf_masks.append(window_masks[j])
-                        self.kf_poses.append(tsdf_pose) 
+                    # Distance checks removed. Every valid frame is now integrated.
+                    tsdf_pose = global_pose.copy()
                     
-                if j >= window_size - overlap:
-                    if j == window_size - overlap:
+                    # Flip OpenCV Y down to TSDF Up
+                    if tsdf_pose[1, 1] < 0:
+                        tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+
+                    scaled_pts = pts_list[j] * self.current_metric_scale
+                    depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
+                    
+                    batch_depths.append(depth_map)
+                    batch_rgbs.append(window_frames[j])
+                    batch_masks.append(window_masks[j])
+                    batch_poses.append(tsdf_pose) 
+                    
+                    self.kf_depths.append(depth_map)
+                    self.kf_rgbs.append(window_frames[j])
+                    self.kf_masks.append(window_masks[j])
+                    self.kf_poses.append(tsdf_pose) 
+                    
+                if j >= self.window_size - self.overlap:
+                    if j == self.window_size - self.overlap:
                         self.prev_overlap_global_poses = []
                     self.prev_overlap_global_poses.append(global_pose)
             
-            self.prev_overlap_raw_pts = pts_list[-overlap:]
+            self.prev_overlap_raw_pts = pts_list[-self.overlap:]
             self.is_first_window = False
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 

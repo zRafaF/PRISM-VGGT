@@ -14,20 +14,13 @@ from prism_vggt.utils.masking import get_spherical_valid_mask
 from prism_vggt.utils.visualization import visualize_polar_mask, visualize_depth
 from prism_vggt.utils.geometry import unproject_equirectangular_to_points
 
-# If you still have the texture baker, import it here:
-try:
-    from texture_optimizer import HighResTextureBaker
-    HAS_TEXTURE_BAKER = True
-except ImportError:
-    HAS_TEXTURE_BAKER = False
-
 print("[UI] Initializing Architecture Stack...")
 perception = PanoVGGTBackend(weights_path="checkpoints/model.pt")
 streaming_engine = StreamingWindowEngine(
     perception=perception, 
     voxel_size=0.02, 
     max_depth=4.5, 
-    keyframe_dist_m=0.10
+    target_camera_height=1.5
 )
 
 backend_state = {
@@ -123,7 +116,6 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     mask = get_spherical_valid_mask(H, W, zenith_deg=zenith_limit, nadir_deg=nadir_limit)
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
 
-    # Use the new decoupled perception API
     preds = perception.process_frame(input_image)
     depth_map = preds["depth"]
 
@@ -155,7 +147,7 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
     zenith_limit, nadir_limit, target_width, target_height, 
-    window_size, overlap, max_depth, voxel_size, keyframe_dist,
+    window_size, overlap, max_depth, voxel_size, camera_height,
     live_stream_toggle
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
@@ -173,11 +165,10 @@ def process_sequence_ui(
     # Update physical engine params
     streaming_engine.max_depth = float(max_depth)
     streaming_engine.voxel_size = float(voxel_size)
-    streaming_engine.min_translation_m = float(keyframe_dist)
+    streaming_engine.target_camera_height = float(camera_height)
 
     last_mesh, last_pcd, last_traj, last_edges = None, None, None, None
     
-    # Execute the new streaming generator (Notice window and overlap are passed here!)
     generator = streaming_engine.process_sequence(
         frames=frames, 
         masks=masks, 
@@ -193,11 +184,11 @@ def process_sequence_ui(
             pcd_path = save_pcd_to_ply(global_pcd, "live_map")
             
             if mesh is None or len(mesh.vertices) == 0:
-                yield fig, pcd_path, None, None, gr.update(interactive=False)
+                yield fig, pcd_path, None, None
             else:
                 backend_state["mesh"] = mesh
                 mesh_path = save_mesh_to_glb(mesh, "final_scene")
-                yield fig, pcd_path, mesh_path, mesh_path, gr.update(interactive=False)
+                yield fig, pcd_path, mesh_path, mesh_path
 
     # Force final render
     if last_pcd is not None:
@@ -205,31 +196,11 @@ def process_sequence_ui(
         pcd_path = save_pcd_to_ply(last_pcd, "live_map")
         
         if last_mesh is None or len(last_mesh.vertices) == 0:
-            yield fig, pcd_path, None, None, gr.update(interactive=True)
+            yield fig, pcd_path, None, None
         else:
             backend_state["mesh"] = last_mesh
             mesh_path = save_mesh_to_glb(last_mesh, "final_scene")
-            yield fig, pcd_path, mesh_path, mesh_path, gr.update(interactive=True)
-
-def run_texture_optimization():
-    if not HAS_TEXTURE_BAKER:
-        raise gr.Error("Texture Baker module not found in environment.")
-    if backend_state["mesh"] is None or len(backend_state["frames"]) == 0:
-        raise gr.Error("You must run SLAM on a sequence first!")
-        
-    gr.Info("Starting GPU Raycasting and topology enhancement...")
-    
-    used_frames = [backend_state["frames"][idx] for idx in streaming_engine.processed_indices]
-    used_poses = streaming_engine.full_poses
-    
-    baker = HighResTextureBaker(device="cuda") 
-    textured_mesh = baker.run_baking_pass(backend_state["mesh"], used_frames, used_poses)
-    
-    temp_dir = tempfile.mkdtemp()
-    obj_path = os.path.join(temp_dir, "high_res_scene.obj")
-    o3d.io.write_triangle_mesh(obj_path, textured_mesh, write_triangle_uvs=True)
-    zip_path = shutil.make_archive(os.path.join(temp_dir, "HighRes_Map"), 'zip', temp_dir)
-    return obj_path, zip_path
+            yield fig, pcd_path, mesh_path, mesh_path
 
 def toggle_input_mode(mode):
     if mode == "Upload Files": return gr.update(visible=True), gr.update(visible=False)
@@ -265,7 +236,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             gr.Markdown("### 🧠 Nvblox Dense GPU Parameters")
             voxel_size_slider = gr.Slider(minimum=0.01, maximum=0.10, value=0.02, step=0.01, label="Voxel Resolution (m) [Lower = Denser]")
             max_depth_slider = gr.Slider(minimum=2.0, maximum=15.0, value=4.5, step=0.5, label="Max Depth Ray Cutoff (m)")
-            keyframe_dist_slider = gr.Slider(minimum=0.05, maximum=1.0, value=0.10, step=0.05, label="Keyframe Stamp Distance (m)")
+            
+            # --- NEW CAMERA HEIGHT SLIDER ---
+            camera_height_slider = gr.Slider(minimum=0.1, maximum=3.0, value=1.5, step=0.1, label="Target Camera Height (m)")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -297,11 +270,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
                         with gr.Tab("Live Geometry (.glb)"):
                             output_mesh = gr.Model3D(label="Real-Time TSDF Mesh")
                             download_mesh = gr.File(label="💾 Download Mesh .glb")
-                        with gr.Tab("High-Res Texture Bake"):
-                            gr.Markdown("Run Pure PyTorch Raycasting to paint ultra-dense topologies.")
-                            optimize_tex_btn = gr.Button("Bake High-Res Textures", variant="primary", interactive=False)
-                            output_highres_mesh = gr.Model3D(label="Textured Mesh Preview")
-                            download_highres_zip = gr.File(label="💾 Download ZIP (OBJ + Textures)")
 
     # --- Events ---
     target_width.release(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
@@ -319,15 +287,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
         inputs=[
             input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, 
             target_width, target_height, window_size_slider, overlap_slider, 
-            max_depth_slider, voxel_size_slider, keyframe_dist_slider, live_stream_checkbox
+            max_depth_slider, voxel_size_slider, camera_height_slider, live_stream_checkbox
         ],
-        outputs=[output_3d_seq, download_seq, output_mesh, download_mesh, optimize_tex_btn]
-    )
-    
-    optimize_tex_btn.click(
-        fn=run_texture_optimization,
-        inputs=[],
-        outputs=[output_highres_mesh, download_highres_zip]
+        outputs=[output_3d_seq, download_seq, output_mesh, download_mesh]
     )
 
 if __name__ == "__main__":
