@@ -1,24 +1,67 @@
+import torch
 import numpy as np
 
 def unproject_equirectangular_to_points(depth_map: np.ndarray) -> np.ndarray:
-    """
-    Converts an equirectangular radial depth map into 3D Cartesian coordinates.
-    Assumes an OpenCV coordinate system (X: right, Y: down, Z: forward).
-    """
+    """Converts an equirectangular radial depth map into 3D Cartesian coordinates."""
     H, W = depth_map.shape
     u, v = np.meshgrid(np.arange(W), np.arange(H))
     
-    # Convert pixels to spherical angles
     theta = (u / W - 0.5) * 2 * np.pi
     phi = (v / H - 0.5) * np.pi
     
-    # Spherical to Cartesian
     X = depth_map * np.cos(phi) * np.sin(theta)
     Y = depth_map * np.sin(phi)
     Z = depth_map * np.cos(phi) * np.cos(theta)
     
     return np.stack([X, Y, Z], axis=-1)
 
-def homogenize_points_np(points: np.ndarray) -> np.ndarray:
-    """Convert batched points (xyz) to homogenous coordinates (xyz1)."""
+def homogenize_points(points):
+    return torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
+
+def homogenize_points_np(points):
     return np.concatenate([points, np.ones_like(points[..., :1])], axis=-1)
+
+def register_camera_poses_kabsch(src_cam_poses: np.ndarray, tgt_cam_poses: np.ndarray, scale=1.0):
+    """
+    Aligns two sets of camera poses using Kabsch algorithm.
+    Fixed centroid bug: Rotation unit vectors are now decoupled from the translational centroid.
+    """
+    assert src_cam_poses.shape == tgt_cam_poses.shape
+    
+    src_pos = src_cam_poses[:, :3, 3] * scale
+    tgt_pos = tgt_cam_poses[:, :3, 3]
+
+    # Calculate centroids ONLY from the actual camera positions
+    src_centroid = np.mean(src_pos, axis=0)
+    tgt_centroid = np.mean(tgt_pos, axis=0)
+    
+    src_centered = src_pos - src_centroid
+    tgt_centered = tgt_pos - tgt_centroid
+
+    # Extract rotation axes to lock orientation
+    src_x = src_cam_poses[:, :3, :3] @ np.array([1., 0., 0.])
+    src_y = src_cam_poses[:, :3, :3] @ np.array([0., 1., 0.])
+    src_z = src_cam_poses[:, :3, :3] @ np.array([0., 0., 1.])
+
+    tgt_x = tgt_cam_poses[:, :3, :3] @ np.array([1., 0., 0.])
+    tgt_y = tgt_cam_poses[:, :3, :3] @ np.array([0., 1., 0.])
+    tgt_z = tgt_cam_poses[:, :3, :3] @ np.array([0., 0., 1.])
+
+    # Append the rotation vectors directly to the centered positions
+    src_pts = np.concatenate([src_centered, src_x, src_y, src_z], axis=0)
+    tgt_pts = np.concatenate([tgt_centered, tgt_x, tgt_y, tgt_z], axis=0)
+
+    # Standard Kabsch SVD
+    H = src_pts.T @ tgt_pts
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # Fix reflection
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    # Translation offset
+    t = tgt_centroid - R @ src_centroid
+    
+    return R, t

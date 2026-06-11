@@ -6,7 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .tsdf import NvbloxPanoTSDF
 from .perception_base import BasePerceptionExtractor
-from .utils.alignment import align_cam_pts_irls, register_camera_poses_kabsch
+
+from .utils.alignment import align_cam_pts_irls 
+from .utils.geometry import register_camera_poses_kabsch
 from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
@@ -18,6 +20,7 @@ class StreamingWindowEngine:
         self.max_depth = max_depth
         self.voxel_size = voxel_size
         self.target_camera_height = target_camera_height 
+        self.min_translation_m = 0.10  # --- FIX 1: Restored Keyframe Filter Limit ---
         
         self.vram_tracker = VRAMProfiler()
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
@@ -53,6 +56,8 @@ class StreamingWindowEngine:
         self.submap_count = 0
         self.is_first_window = True
         self.current_metric_scale = 1.0
+        
+        self.last_integrated_position = None
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         for j in range(len(poses)):
@@ -142,14 +147,12 @@ class StreamingWindowEngine:
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
             
-            # --- 0. Sync Previous Background Tasks ---
             t0 = time.time()
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
                 self.tsdf_future = None
-            profiler["TSDF_Thread_Sync"] = time.time() - t0
+            profiler["TSDF_Sync"] = time.time() - t0
             
-            # --- 1. Perception Extraction ---
             t1 = time.time()
             preds = self.perception.process_sequence(window_frames)
             torch.cuda.synchronize()  
@@ -157,18 +160,21 @@ class StreamingWindowEngine:
 
             pts_list, poses = preds["points"], preds["poses"]
             
-            # --- 2. Alignment & Scale Correction ---
             t2 = time.time()
             mid_idx = self.window_size // 2
-            floor_scale, floor_conf = estimate_metric_scale_from_floor(pts_list[mid_idx], target_camera_height=self.target_camera_height)
             
-            # Clamp floor scale defensively so anomalies don't explode the scene size and OOM Nvblox
-            if floor_scale is not None:
-                floor_scale = np.clip(floor_scale, 0.1, 5.0)
-
+            # Pre-scale points before RANSAC Metrification
+            metric_pts_guess = pts_list[mid_idx] * self.current_metric_scale
+            
+            floor_scale_correction, floor_conf = estimate_metric_scale_from_floor(
+                metric_pts_guess, 
+                target_camera_height=self.target_camera_height
+            )
+            
+            # --- FIX 2: Restored Scale Dampening ---
             if self.is_first_window:
-                if floor_scale is not None:
-                    self.current_metric_scale = floor_scale
+                if floor_scale_correction is not None:
+                    self.current_metric_scale = self.current_metric_scale * floor_scale_correction
                 else:
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
@@ -181,14 +187,21 @@ class StreamingWindowEngine:
                     torch.from_numpy(window_masks[0].copy())
                 )
                 clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
-                relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
-                self.current_metric_scale = (0.9 * relative_scale + 0.1 * floor_scale) if (floor_scale and floor_conf > 0.4) else relative_scale
                 
+                # 80% memory / 20% new IRLS reading
+                relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
+                
+                if floor_scale_correction is not None and floor_conf > 0.4:
+                    absolute_floor_scale = self.current_metric_scale * floor_scale_correction
+                    # 90% running scale / 10% floor correction
+                    self.current_metric_scale = 0.9 * relative_scale + 0.1 * absolute_floor_scale
+                else:
+                    self.current_metric_scale = relative_scale
+
             self.current_metric_scale = np.clip(self.current_metric_scale, 0.1, 5.0)
 
             metric_local_poses = []
             for p in poses:
-                # REVERTED: PanoVGGT is already C2W. Extracting position without inverting fixes the spiderweb.
                 mp = p.copy()
                 mp[:3, 3] *= self.current_metric_scale 
                 metric_local_poses.append(mp)
@@ -198,12 +211,11 @@ class StreamingWindowEngine:
 
             anchor_pose = np.eye(4)
             if not self.is_first_window:
-                R_align, t_align = register_camera_poses_kabsch(
-                    np.stack(canonical_poses[:self.overlap]), 
-                    np.stack(self.prev_overlap_global_poses), 
-                    scale=1.0
-                )
-                anchor_pose[:3, :3], anchor_pose[:3, 3] = R_align, t_align
+                src_cam_np = np.stack(canonical_poses[:self.overlap])
+                tgt_cam_np = np.stack(self.prev_overlap_global_poses)
+                R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
+                anchor_pose[:3, :3] = R_align
+                anchor_pose[:3, 3] = t_align
                 
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             start_idx = 0 if self.is_first_window else self.overlap
@@ -213,28 +225,41 @@ class StreamingWindowEngine:
                 
                 if j >= start_idx:
                     current_pos = global_pose[:3, 3]
-                    self.trajectory.append(current_pos)
-                    self.processed_indices.append(i + j)
-                    self.full_poses.append(global_pose)
                     
-                    tsdf_pose = global_pose.copy()
-                    
-                    # Flip OpenCV Y down to TSDF Up
-                    if tsdf_pose[1, 1] < 0:
-                        tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                    # --- FIX 1 (cont): Spatial Keyframing Logic ---
+                    should_integrate = False
+                    if self.last_integrated_position is None:
+                        should_integrate = True
+                    else:
+                        dist = np.linalg.norm(current_pos - self.last_integrated_position)
+                        if dist >= self.min_translation_m:
+                            should_integrate = True
 
-                    scaled_pts = pts_list[j] * self.current_metric_scale
-                    depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
-                    
-                    batch_depths.append(depth_map)
-                    batch_rgbs.append(window_frames[j])
-                    batch_masks.append(window_masks[j])
-                    batch_poses.append(tsdf_pose) 
-                    
-                    self.kf_depths.append(depth_map)
-                    self.kf_rgbs.append(window_frames[j])
-                    self.kf_masks.append(window_masks[j])
-                    self.kf_poses.append(tsdf_pose) 
+                    if should_integrate:
+                        self.last_integrated_position = current_pos.copy()
+                        
+                        # Only append to trajectory if it passes the distance threshold 
+                        self.trajectory.append(current_pos)
+                        self.processed_indices.append(i + j)
+                        self.full_poses.append(global_pose)
+                        
+                        tsdf_pose = global_pose.copy()
+                        
+                        if tsdf_pose[1, 1] < 0:
+                            tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+
+                        scaled_pts = pts_list[j] * self.current_metric_scale
+                        depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
+                        
+                        batch_depths.append(depth_map)
+                        batch_rgbs.append(window_frames[j])
+                        batch_masks.append(window_masks[j])
+                        batch_poses.append(tsdf_pose) 
+                        
+                        self.kf_depths.append(depth_map)
+                        self.kf_rgbs.append(window_frames[j])
+                        self.kf_masks.append(window_masks[j])
+                        self.kf_poses.append(tsdf_pose) 
                     
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
@@ -245,23 +270,24 @@ class StreamingWindowEngine:
             self.is_first_window = False
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
-            # --- 3. Enqueue TSDF Background Mapping ---
             t3 = time.time()
             if len(batch_poses) > 0:
-                print(f"  > [TSDF] Enqueuing {len(batch_poses)} frames. Map Scale Factor: {self.current_metric_scale:.2f}")
+                print(f"  > [TSDF] Sending {len(batch_poses)} Keyframes to C++ Background Mapper...")
                 self.tsdf_future = self.tsdf_executor.submit(
                     self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
                 )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
-            # --- 4. Intermediate Geometry Extraction ---
             t4 = time.time()
+            
+            if self.tsdf_future is not None:
+                self.tsdf_future.result()
+                self.tsdf_future = None
+                
+            current_raw_mesh = self.tsdf.extract_mesh() 
+            
             if self.submap_count % 3 == 0:
-                if self.tsdf_future is not None:
-                    self.tsdf_future.result()
-                    self.tsdf_future = None
-                    
-                self.last_mesh = self.tsdf.extract_mesh()
+                self.last_mesh = current_raw_mesh
                 self.last_pcd = o3d.geometry.PointCloud()
                 
                 if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
@@ -276,10 +302,12 @@ class StreamingWindowEngine:
                     valid_color_mask = colored_vertices.sum(axis=1) > 0.0
                     self.last_pcd.points = o3d.utility.Vector3dVector(np.asarray(self.last_mesh.vertices)[valid_color_mask])
                     self.last_pcd.colors = o3d.utility.Vector3dVector(colored_vertices[valid_color_mask])
+                    
             profiler["Meshing_&_Coloring"] = time.time() - t4
+            
+            torch.cuda.empty_cache()
 
             pt_alloc, pt_res, sys_used, sys_total = self.vram_tracker.stop()
-            
             print("  --- ⏱️ Process Timing (Seconds) ---")
             for k, v in profiler.items():
                 print(f"    - {k:<20}: {v:.3f}s")
@@ -288,14 +316,12 @@ class StreamingWindowEngine:
             print("  --- 💾 GPU Memory (VRAM) ---")
             print(f"    - PyTorch Peak Alloc  : {pt_alloc:.2f} GB")
             print(f"    - System VRAM Usage   : {sys_used:.2f} GB / {sys_total:.2f} GB")
-            
             self.submap_count += 1
 
             yield_mesh = self.last_mesh if self.last_mesh else o3d.geometry.TriangleMesh()
             yield_pcd = self.last_pcd if self.last_pcd else o3d.geometry.PointCloud()
             yield yield_mesh, yield_pcd, np.array(self.trajectory), []
 
-        # --- Final Global Extraction ---
         if self.tsdf_future is not None:
             self.tsdf_future.result()
 
@@ -306,13 +332,10 @@ class StreamingWindowEngine:
         
         if final_mesh is not None and len(final_mesh.vertices) > 0:
             final_mesh.compute_vertex_normals()
-            t_mesh_start = time.time()
             final_colors = self._apply_pytorch_colors(
                 np.asarray(final_mesh.vertices), np.asarray(final_mesh.vertex_normals),
                 self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
             )
-            print(f"  > Final Global Map Colored in {(time.time() - t_mesh_start):.2f}s")
-            
             final_mesh.vertex_colors = o3d.utility.Vector3dVector(final_colors)
             
             valid_color_mask = final_colors.sum(axis=1) > 0.0

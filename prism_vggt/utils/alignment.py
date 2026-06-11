@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-from typing import Tuple
 
 def align_cam_pts_irls(
     src_pts: torch.Tensor,  
@@ -48,44 +47,3 @@ def align_cam_pts_irls(
         s_d = s_d_new
         
     return float(s_d)
-
-def register_camera_poses_kabsch(src_cam_poses: np.ndarray, tgt_cam_poses: np.ndarray, scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Aligns two sets of camera poses using Kabsch algorithm.
-    Enhanced with full 3D coordinate frame locking to prevent collinear degeneracy.
-    """
-    assert src_cam_poses.shape == tgt_cam_poses.shape
-    
-    src_pos = src_cam_poses[:, :3, 3] * scale
-    tgt_pos = tgt_cam_poses[:, :3, 3]
-
-    # Extract full coordinate frame (X, Y, Z axes) for orientation locking
-    src_x = src_cam_poses[:, :3, :3] @ np.array([1., 0., 0.])
-    src_y = src_cam_poses[:, :3, :3] @ np.array([0., 1., 0.])
-    src_z = src_cam_poses[:, :3, :3] @ np.array([0., 0., 1.])
-
-    tgt_x = tgt_cam_poses[:, :3, :3] @ np.array([1., 0., 0.])
-    tgt_y = tgt_cam_poses[:, :3, :3] @ np.array([0., 1., 0.])
-    tgt_z = tgt_cam_poses[:, :3, :3] @ np.array([0., 0., 1.])
-
-    src_pts = np.concatenate([src_pos, src_pos + src_x, src_pos + src_y, src_pos + src_z], axis=0)
-    tgt_pts = np.concatenate([tgt_pos, tgt_pos + tgt_x, tgt_pos + tgt_y, tgt_pos + tgt_z], axis=0)
-
-    src_centroid = np.mean(src_pts, axis=0)
-    tgt_centroid = np.mean(tgt_pts, axis=0)
-
-    src_pts_centered = src_pts - src_centroid
-    tgt_pts_centered = tgt_pts - tgt_centroid
-
-    H = src_pts_centered.T @ tgt_pts_centered
-    U, S, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
-
-    # Fix improper rotation (reflection)
-    if np.linalg.det(R) < 0:
-        Vt[-1, :] *= -1
-        R = Vt.T @ U.T
-
-    t = tgt_centroid - R @ src_centroid
-    
-    return R, t

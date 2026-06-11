@@ -4,10 +4,8 @@ import open3d as o3d
 import plotly.graph_objects as go
 import tempfile
 import os
-import shutil
 from PIL import Image
 
-# --- NEW PRISM-VGGT IMPORTS ---
 from prism_vggt.backends.panovggt import PanoVGGTBackend
 from prism_vggt.engine import StreamingWindowEngine
 from prism_vggt.utils.masking import get_spherical_valid_mask
@@ -23,12 +21,8 @@ streaming_engine = StreamingWindowEngine(
     target_camera_height=1.5
 )
 
-backend_state = {
-    "frames": [],
-    "mesh": None
-}
+backend_state = {"frames": [], "mesh": None}
 
-# --- Helper Functions ---
 def get_o3d_pcd(xyz_points, rgb_image, mask):
     valid_mask = mask.astype(bool)
     pcd = o3d.geometry.PointCloud()
@@ -43,8 +37,7 @@ def save_pcd_to_ply(pcd, prefix="reconstruction"):
     return ply_path
 
 def save_mesh_to_glb(mesh, prefix="reconstruction"):
-    if mesh is None or len(mesh.vertices) == 0:
-        return None
+    if mesh is None or len(mesh.vertices) == 0: return None
     temp_dir = tempfile.mkdtemp()
     glb_path = os.path.join(temp_dir, f"{prefix}.glb")
     o3d.io.write_triangle_mesh(glb_path, mesh)
@@ -58,14 +51,8 @@ def create_plotly_figure_from_pcd(pcd, max_points=150000):
         points, colors = points[idx], colors[idx]
 
     colors_str = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in colors]
-    fig = go.Figure(data=[go.Scatter3d(
-        x=points[:, 0], y=points[:, 2], z=-points[:, 1],
-        mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0)
-    )])
-    fig.update_layout(
-        scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
-        margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111"
-    )
+    fig = go.Figure(data=[go.Scatter3d(x=points[:, 0], y=points[:, 2], z=-points[:, 1], mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0))])
+    fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111")
     return fig
 
 def create_plotly_figure_with_trajectory(pcd, trajectory, lc_edges, max_points=150000):
@@ -78,10 +65,7 @@ def create_plotly_figure_with_trajectory(pcd, trajectory, lc_edges, max_points=1
     colors_str = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in colors]
     
     fig = go.Figure()
-    fig.add_trace(go.Scatter3d(
-        x=points[:, 0], y=points[:, 2], z=-points[:, 1],
-        mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0), name='Geometry'
-    ))
+    fig.add_trace(go.Scatter3d(x=points[:, 0], y=points[:, 2], z=-points[:, 1], mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0), name='Geometry'))
     
     if trajectory is not None and len(trajectory) > 0:
         fig.add_trace(go.Scatter3d(
@@ -90,23 +74,9 @@ def create_plotly_figure_with_trajectory(pcd, trajectory, lc_edges, max_points=1
             line=dict(color='cyan', width=4), marker=dict(size=4, color='orange')
         ))
         
-    fig.update_layout(
-        scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
-        margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111", legend=dict(x=0.02, y=0.98, font=dict(color="white"))
-    )
+    fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111", legend=dict(x=0.02, y=0.98, font=dict(color="white")))
     return fig
 
-def enforce_resolution(w, h, step, link, trigger):
-    step = max(1, int(step))
-    if link:
-        if trigger == 'w': h = w / 2.0
-        elif trigger == 'h': w = h * 2.0
-    w_snap = int(round(w / step) * step)
-    h_snap = int(round(h / step) * step)
-    actual_ratio = w_snap / h_snap if h_snap > 0 else 0
-    return w_snap, h_snap, f"📐 **Processing Dimensions:** {w_snap} $\\times$ {h_snap} | **Actual Ratio:** {actual_ratio:.4f}"
-
-# --- Tab 1: Single Frame ---
 def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_width, target_height):
     if input_image_pil is None: return None, None, None, None
     input_image_pil = input_image_pil.resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
@@ -126,15 +96,14 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     pcd = get_o3d_pcd(xyz_points, input_image, mask)
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd, "single_frame")
 
-# --- Input Handling ---
 def get_file_list(input_mode, uploaded_files, local_dir, decimation):
     valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
-    files = []
     if input_mode == "Upload Files" and uploaded_files:
         files = sorted([f.name for f in uploaded_files])
     elif input_mode != "Upload Files" and local_dir and os.path.isdir(local_dir):
         files = sorted([os.path.join(local_dir, f) for f in os.listdir(local_dir) if f.lower().endswith(valid_exts)])
-
+    else:
+        return []
     step = max(1, int(decimation) + 1)
     return files[::step]
 
@@ -143,16 +112,14 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
     if not files: return "⚠️ No valid images found."
     return f"✅ Total files to process: {len(files)}\n\n" + "\n".join(f"{i + 1}. {os.path.basename(n)}" for i, n in enumerate(files))
 
-# --- Tab 2: Sequence Processing ---
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
     zenith_limit, nadir_limit, target_width, target_height, 
-    window_size, overlap, max_depth, voxel_size, camera_height,
+    window_size, overlap, max_depth, voxel_size, camera_height, keyframe_dist,
     live_stream_toggle
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
-    if not file_paths or len(file_paths) < 2:
-        raise gr.Error("Please provide at least 2 valid images.")
+    if not file_paths or len(file_paths) < 2: raise gr.Error("Please provide at least 2 valid images.")
 
     frames, masks = [], []
     for path in file_paths:
@@ -162,27 +129,19 @@ def process_sequence_ui(
 
     backend_state["frames"] = frames
     
-    # Update physical engine params
     streaming_engine.max_depth = float(max_depth)
     streaming_engine.voxel_size = float(voxel_size)
     streaming_engine.target_camera_height = float(camera_height)
+    streaming_engine.min_translation_m = float(keyframe_dist)
 
     last_mesh, last_pcd, last_traj, last_edges = None, None, None, None
-    
-    generator = streaming_engine.process_sequence(
-        frames=frames, 
-        masks=masks, 
-        window_size=int(window_size), 
-        overlap=int(overlap)
-    )
+    generator = streaming_engine.process_sequence(frames=frames, masks=masks, window_size=int(window_size), overlap=int(overlap))
     
     for mesh, global_pcd, trajectory, lc_edges in generator:
         last_mesh, last_pcd, last_traj, last_edges = mesh, global_pcd, trajectory, lc_edges
-        
         if live_stream_toggle:
             fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
             pcd_path = save_pcd_to_ply(global_pcd, "live_map")
-            
             if mesh is None or len(mesh.vertices) == 0:
                 yield fig, pcd_path, None, None
             else:
@@ -190,11 +149,9 @@ def process_sequence_ui(
                 mesh_path = save_mesh_to_glb(mesh, "final_scene")
                 yield fig, pcd_path, mesh_path, mesh_path
 
-    # Force final render
     if last_pcd is not None:
         fig = create_plotly_figure_with_trajectory(last_pcd, last_traj, last_edges)
         pcd_path = save_pcd_to_ply(last_pcd, "live_map")
-        
         if last_mesh is None or len(last_mesh.vertices) == 0:
             yield fig, pcd_path, None, None
         else:
@@ -202,12 +159,6 @@ def process_sequence_ui(
             mesh_path = save_mesh_to_glb(last_mesh, "final_scene")
             yield fig, pcd_path, mesh_path, mesh_path
 
-def toggle_input_mode(mode):
-    if mode == "Upload Files": return gr.update(visible=True), gr.update(visible=False)
-    else: return gr.update(visible=False), gr.update(visible=True)
-
-
-# --- UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox") as demo:
     gr.Markdown("# 🌐 PRISM-VGGT: Alignment & Streaming Sandbox")
 
@@ -223,8 +174,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
 
             target_width = gr.Slider(minimum=224, maximum=4096, value=1036, step=1, label="Target Width")
             target_height = gr.Slider(minimum=112, maximum=2048, value=518, step=1, label="Target Height")
-            ratio_info = gr.Markdown("📐 **Processing Dimensions:** 1036 $\\times$ 518")
-
+            
             gr.Markdown("### Polar Exclusion Limits")
             zenith_slider = gr.Slider(minimum=0, maximum=90, value=75, step=1, label="Zenith Limit")
             nadir_slider = gr.Slider(minimum=-90, maximum=0, value=-60, step=1, label="Nadir Limit")
@@ -236,9 +186,10 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             gr.Markdown("### 🧠 Nvblox Dense GPU Parameters")
             voxel_size_slider = gr.Slider(minimum=0.01, maximum=0.10, value=0.02, step=0.01, label="Voxel Resolution (m) [Lower = Denser]")
             max_depth_slider = gr.Slider(minimum=2.0, maximum=15.0, value=4.5, step=0.5, label="Max Depth Ray Cutoff (m)")
-            
-            # --- NEW CAMERA HEIGHT SLIDER ---
             camera_height_slider = gr.Slider(minimum=0.1, maximum=3.0, value=1.5, step=0.1, label="Target Camera Height (m)")
+            
+            # --- FIX: Reinstated Keyframe Distance Slider ---
+            keyframe_dist_slider = gr.Slider(minimum=0.05, maximum=1.0, value=0.10, step=0.05, label="Keyframe Stamp Distance (m)")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -271,15 +222,18 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
                             output_mesh = gr.Model3D(label="Real-Time TSDF Mesh")
                             download_mesh = gr.File(label="💾 Download Mesh .glb")
 
-    # --- Events ---
-    target_width.release(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
-    target_height.release(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
-    link_ratio.change(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
-    step_size.change(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
+    def enforce_res(w, h, step, link, trig):
+        step = max(1, int(step))
+        if link:
+            if trig == 'w': h = w / 2.0
+            elif trig == 'h': w = h * 2.0
+        return int(round(w / step) * step), int(round(h / step) * step)
 
-    input_mode.change(fn=toggle_input_mode, inputs=input_mode, outputs=[input_seq, local_dir_input])
+    target_width.release(fn=lambda w, h, s, l: enforce_res(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height])
+    target_height.release(fn=lambda w, h, s, l: enforce_res(w, h, s, l, 'h'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height])
+    
+    input_mode.change(fn=lambda m: (gr.update(visible=m=="Upload Files"), gr.update(visible=m!="Upload Files")), inputs=input_mode, outputs=[input_seq, local_dir_input])
     check_files_btn.click(fn=check_files_ui, inputs=[input_mode, input_seq, local_dir_input, decimation_input], outputs=[checked_files_output], api_name=False)
-
     run_single_btn.click(fn=process_single_frame, inputs=[input_img, zenith_slider, nadir_slider, target_width, target_height], outputs=[output_rgb, output_depth, output_3d_single, download_single])
 
     run_seq_btn.click(
@@ -287,7 +241,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
         inputs=[
             input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, 
             target_width, target_height, window_size_slider, overlap_slider, 
-            max_depth_slider, voxel_size_slider, camera_height_slider, live_stream_checkbox
+            max_depth_slider, voxel_size_slider, camera_height_slider, keyframe_dist_slider, live_stream_checkbox
         ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh]
     )
