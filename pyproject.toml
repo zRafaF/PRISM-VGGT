@@ -1,0 +1,62 @@
+[project]
+name = "prism-vggt"
+version = "0.1.0"
+description = "Training-Free Streaming 3D Reconstruction from Panoramic Video using PanoVGGT and Nvblox"
+readme = "README.md"
+requires-python = "==3.11.*"
+
+# --- CORE LIBRARY DEPENDENCIES ---
+# Minimal requirements to run the engine, load weights, and execute the TSDF fusion logic.
+dependencies = [
+    "torch==2.4.*",
+    "torchvision>=0.19.0",
+    "torchaudio>=2.4.0",
+    "xformers>=0.0.27.post2",
+    # Math & Arrays
+    "numpy==1.26.4",
+    "scipy",
+    "pandas",
+    # Core Geometry & Model Processing
+    "open3d",
+    "trimesh",
+    "plyfile",
+    "pypose",
+    "kornia",
+    # Model Architecture Utils
+    "einops",
+    "huggingface-hub",
+    "safetensors",
+    # System & Configuration
+    "hydra-core",
+    "omegaconf",
+    "yacs",
+    "colorlog",
+    "tqdm",
+    "cython",
+    "numba",
+]
+
+# --- OPTIONAL EXTENSIONS ---
+[project.optional-dependencies]
+# Dependencies required for splitframes.py, ui_main.py, and pano_viz.py
+apps = [
+    "gradio>=5.17.1",
+    "fastapi==0.119.0",
+    "flask==3.1.2",
+    "plotly>=6.7.0",
+    "opencv-python",
+    "pillow",
+    "imageio",
+    "scikit-image",
+]
+
+# Dependencies required for metrics calculation, trajectory evaluation, and logging
+benchmarks = [
+    "evo",
+    "scikit-learn",
+    "tensorboard",
+]
+
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build-meta"

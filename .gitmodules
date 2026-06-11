@@ -1,0 +1,3 @@
+[submodule "third_party/PanoVGGT"]
+	path = third_party/PanoVGGT
+	url = https://github.com/zRafaF/PanoVGGT
