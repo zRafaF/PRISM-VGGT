@@ -79,4 +79,4 @@ with gr.Blocks(title="Server File Downloader") as demo:
 if __name__ == "__main__":
     # Launch the server. 
     # server_name="0.0.0.0" exposes it to your local network.
-    demo.launch(server_name="0.0.0.0", server_port=7861)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
