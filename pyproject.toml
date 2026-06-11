@@ -54,7 +54,7 @@ benchmarks = [
     "tensorboard",
 ]
 
-# --- BUILD SYSTEM FIX ---
+# --- BUILD SYSTEM ---
 [build-system]
 requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -75,3 +75,6 @@ xformers = { index = "pytorch-cu124" }
 [tool.uv.extra-build-dependencies]
 xformers = ["torch>=2.4.0"]
 prism-vggt = ["Cython", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ["prism_vggt*"]
