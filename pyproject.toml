@@ -33,13 +33,14 @@ dependencies = [
     "tqdm",
     "cython",
     "numba",
+    "nvblox-torch @ https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu22-py3-none-linux_x86_64.whl ; sys_platform == 'linux'",
 ]
 
 # --- OPTIONAL EXTENSIONS ---
 [project.optional-dependencies]
 apps = [
-    "gradio>=5.17.1",
-    "fastapi==0.119.0",
+    "gradio>=6.17.3",
+    "fastapi>=0.136.3",
     "flask==3.1.2",
     "plotly>=6.7.0",
     "opencv-python",
