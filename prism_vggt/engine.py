@@ -110,7 +110,13 @@ class StreamingWindowEngine:
             dot_prod = (view_dirs_w * n_chunk.unsqueeze(0)).sum(dim=-1)
             
             valid_condition = (dist > 0.1) & (sampled_masks > 0.5) & is_visible & (dot_prod > 0) & (sampled_colors.sum(dim=1) > 0.15)
-            score = torch.where(valid_condition, (dot_prod * torch.cos(v_norm.squeeze(2) * (torch.pi/2))) / (dist**2 + 1e-6), torch.tensor(-1.0, device=device))
+            
+            # [THE FIX]: Multiply by v_norm directly without the erroneous squeeze call
+            score = torch.where(
+                valid_condition, 
+                (dot_prod * torch.cos(v_norm * (torch.pi / 2.0))) / (dist**2 + 1e-6), 
+                torch.tensor(-1.0, device=device)
+            )
 
             max_scores, best_cam_idx = torch.max(score, dim=0)
             update_mask = max_scores > -1.0

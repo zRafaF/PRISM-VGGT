@@ -72,14 +72,16 @@ class PanoVGGTBackend(BasePerceptionExtractor):
         # Preprocess: [B, H, W, C] -> [1, B, C, H, W]
         img_tensors = [torch.from_numpy(img).float() / 255.0 for img in rgb_images]
         batch_tensor = torch.stack(img_tensors).permute(0, 3, 1, 2)
-        batch_tensor = batch_tensor.unsqueeze(0).to(self.device)  # Add pseudo-batch dim for VGGT
+        batch_tensor = batch_tensor.unsqueeze(0).to(self.device)  
         
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         with torch.amp.autocast("cuda", dtype=dtype):
             preds = self.model(batch_tensor)
             
-        # 1. Robust Pose Extraction (VGGT architectures differ in their naming conventions)
-        if "poses" in preds:
+        # 1. Robust Pose Extraction
+        if "camera_poses" in preds:
+            raw_poses = preds["camera_poses"]
+        elif "poses" in preds:
             raw_poses = preds["poses"]
         elif "pose" in preds:
             raw_poses = preds["pose"]
@@ -87,7 +89,6 @@ class PanoVGGTBackend(BasePerceptionExtractor):
             raw_poses = preds["camera"]
         else:
             print(f"⚠️ [WARNING] Could not find pose key. Available keys: {list(preds.keys())}")
-            # Fallback to Identity matrices if the model is running in a depth-only configuration
             raw_poses = torch.eye(4, device=self.device).unsqueeze(0).unsqueeze(0).repeat(1, batch_tensor.shape[1], 1, 1)
 
         # 2. Extract Points
@@ -98,7 +99,6 @@ class PanoVGGTBackend(BasePerceptionExtractor):
         # 3. Extract Depths
         raw_depths = preds.get("depth")
         if raw_depths is None:
-            # If explicit depth map is missing, derive it radially from the local points
             raw_depths = torch.norm(raw_points, dim=-1)
             
         return {
