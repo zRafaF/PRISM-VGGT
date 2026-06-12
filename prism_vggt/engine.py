@@ -128,6 +128,40 @@ class StreamingWindowEngine:
 
         return final_colors.cpu().numpy()
 
+    @torch.no_grad()
+    def get_full_map(self):
+        """Extract the current fused TSDF surface as a colored mesh + point cloud.
+
+        This is the "fetch the whole map" half of the streaming contract: it is
+        independent of the per-submap point stream and can be called on demand
+        (e.g. by the parent project) at whatever cadence it needs, since it pays
+        the cost of GPU mesh extraction (marching cubes) + multi-keyframe vertex
+        coloring.
+
+        Returns:
+            (mesh, pcd): an open3d.geometry.TriangleMesh and a colored
+            open3d.geometry.PointCloud built from its vertices. Both are empty
+            (but valid) geometries if the map has no integrated data yet.
+        """
+        mesh = self.tsdf.extract_mesh()
+        pcd = o3d.geometry.PointCloud()
+
+        if mesh is not None and len(mesh.vertices) > 0:
+            mesh.compute_vertex_normals()
+            colors = self._apply_pytorch_colors(
+                np.asarray(mesh.vertices), np.asarray(mesh.vertex_normals),
+                self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
+            )
+            mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+
+            valid_color_mask = colors.sum(axis=1) > 0.0
+            pcd.points = o3d.utility.Vector3dVector(np.asarray(mesh.vertices)[valid_color_mask])
+            pcd.colors = o3d.utility.Vector3dVector(colors[valid_color_mask])
+        else:
+            mesh = o3d.geometry.TriangleMesh()
+
+        return mesh, pcd
+
     def process_sequence(self, frames, masks, window_size=16, overlap=4):
         self.window_size = window_size
         self.overlap = overlap
@@ -279,30 +313,16 @@ class StreamingWindowEngine:
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
             t4 = time.time()
-            
+
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
                 self.tsdf_future = None
-                
-            current_raw_mesh = self.tsdf.extract_mesh() 
-            
-            if self.submap_count % 3 == 0:
-                self.last_mesh = current_raw_mesh
-                self.last_pcd = o3d.geometry.PointCloud()
-                
-                if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
-                    self.last_mesh.compute_vertex_normals()
-                    colored_vertices = self._apply_pytorch_colors(
-                        np.asarray(self.last_mesh.vertices),
-                        np.asarray(self.last_mesh.vertex_normals),
-                        self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
-                    )
-                    self.last_mesh.vertex_colors = o3d.utility.Vector3dVector(colored_vertices)
-                    
-                    valid_color_mask = colored_vertices.sum(axis=1) > 0.0
-                    self.last_pcd.points = o3d.utility.Vector3dVector(np.asarray(self.last_mesh.vertices)[valid_color_mask])
-                    self.last_pcd.colors = o3d.utility.Vector3dVector(colored_vertices[valid_color_mask])
-                    
+
+            # Always extract + color the fused map for this submap's stream output.
+            # (Previously throttled to every 3rd submap, which left stale geometry
+            # in the stream for the skipped submaps.)
+            self.last_mesh, self.last_pcd = self.get_full_map()
+
             profiler["Meshing_&_Coloring"] = time.time() - t4
             
             torch.cuda.empty_cache()
@@ -327,19 +347,6 @@ class StreamingWindowEngine:
 
         print("\n==========================================")
         print(f"[Engine] Sequence Complete ({(time.time() - t_seq_start):.2f}s). Extracting Unified Global Mesh...")
-        final_mesh = self.tsdf.extract_mesh()
-        final_pcd = o3d.geometry.PointCloud()
-        
-        if final_mesh is not None and len(final_mesh.vertices) > 0:
-            final_mesh.compute_vertex_normals()
-            final_colors = self._apply_pytorch_colors(
-                np.asarray(final_mesh.vertices), np.asarray(final_mesh.vertex_normals),
-                self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
-            )
-            final_mesh.vertex_colors = o3d.utility.Vector3dVector(final_colors)
-            
-            valid_color_mask = final_colors.sum(axis=1) > 0.0
-            final_pcd.points = o3d.utility.Vector3dVector(np.asarray(final_mesh.vertices)[valid_color_mask])
-            final_pcd.colors = o3d.utility.Vector3dVector(final_colors[valid_color_mask])
+        final_mesh, final_pcd = self.get_full_map()
 
         yield final_mesh, final_pcd, np.array(self.trajectory), []

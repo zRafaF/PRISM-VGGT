@@ -19,7 +19,7 @@ Originally starting as a spinoff of [LASER](https://github.com/neu-vi/LASER), we
 Because this project relies on a submodule, ensure you clone recursively. Then, run our automated setup script:
 
 ```bash
-git clone --recurse-submodules [https://github.com/zRafaF/PRISM-VGGT](https://github.com/zRafaF/PRISM-VGGT)
+git clone --recurse-submodules https://github.com/zRafaF/PRISM-VGGT
 cd PRISM-VGGT
 chmod +x setup.sh
 ./setup.sh
