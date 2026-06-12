@@ -234,6 +234,9 @@ class StreamingWindowEngine:
 
             self.current_metric_scale = np.clip(self.current_metric_scale, 0.1, 5.0)
 
+            print(f"  [Scale] floor_scale={floor_scale}, floor_conf={floor_conf:.3f} "
+                  f"-> current_metric_scale={self.current_metric_scale:.4f}")
+
             metric_local_poses = []
             for p in poses:
                 mp = p.copy()
@@ -250,7 +253,12 @@ class StreamingWindowEngine:
                 R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
                 anchor_pose[:3, :3] = R_align
                 anchor_pose[:3, 3] = t_align
-                
+
+                aligned_pos = np.array([(anchor_pose @ canonical_poses[k])[:3, 3] for k in range(self.overlap)])
+                tgt_pos = tgt_cam_np[:, :3, 3]
+                residual = np.linalg.norm(aligned_pos - tgt_pos, axis=-1)
+                print(f"  [Align] Kabsch overlap residual (m): mean={residual.mean():.4f}, max={residual.max():.4f}")
+
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             start_idx = 0 if self.is_first_window else self.overlap
             
