@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import open3d as o3d
@@ -13,14 +14,19 @@ from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
 class StreamingWindowEngine:
-    def __init__(self, perception: BasePerceptionExtractor, voxel_size=0.02, max_depth=4.5, target_camera_height=1.5, device="cuda"):
+    def __init__(self, perception: BasePerceptionExtractor, voxel_size=0.02, max_depth=4.5, target_camera_height=1.5, device="cuda", debug_dump_dir="debug_dumps"):
         self.perception = perception
         self.device = device
-        
+
         self.max_depth = max_depth
         self.voxel_size = voxel_size
-        self.target_camera_height = target_camera_height 
+        self.target_camera_height = target_camera_height
         self.min_translation_m = 0.10  # --- FIX 1: Restored Keyframe Filter Limit ---
+
+        # Per-run diagnostics dumps (poses/scales/floor planes; a few KB per submap).
+        # Set to None to disable. Analyze with apps/diagnose_run.py.
+        self.debug_dump_dir = debug_dump_dir
+        self._run_dump_dir = None
         
         self.vram_tracker = VRAMProfiler()
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
@@ -162,11 +168,84 @@ class StreamingWindowEngine:
 
         return mesh, pcd
 
+    def _report_submap_diagnostics(self, submap_idx, frame_offset, raw_poses, canonical_poses,
+                                   global_window_poses, anchor_pose, floor_plane, floor_scale,
+                                   floor_conf, mid_idx, flip_frames, kept_positions):
+        """Print + dump per-submap diagnostics.
+
+        Key output: camera height above the RANSAC floor plane, measured in the
+        GLOBAL frame — i.e. the same quantity the user eyeballs in the viewer
+        (trajectory dot vs. mesh floor). If these print ~target_camera_height but
+        the viewer shows more, the mesh floor is misplaced (TSDF/integration side).
+        If these print too high, the floor fit / scale chain is the problem.
+        """
+        s = self.current_metric_scale
+        heights = None
+        plane_global = None
+        if floor_plane is not None:
+            a, b, c, d = floor_plane
+            n = np.array([a, b, c], dtype=np.float64)
+            n /= np.linalg.norm(n)
+            T_mid = global_window_poses[mid_idx]
+            # Plane in raw mid-cam frame: n·x + d = 0  ->  global: n_g·x + d_g = 0
+            n_g = T_mid[:3, :3] @ n
+            d_g = s * d - float(n_g @ T_mid[:3, 3])
+            sign = 1.0 if d >= 0 else -1.0
+            heights = np.array([(float(n_g @ T[:3, 3]) + d_g) * sign for T in global_window_poses])
+            plane_global = np.concatenate([n_g, [d_g]])
+
+        R_a = anchor_pose[:3, :3]
+        anchor_deg = float(np.degrees(np.arccos(np.clip((np.trace(R_a) - 1) / 2, -1.0, 1.0))))
+        anchor_t = float(np.linalg.norm(anchor_pose[:3, 3]))
+        r11_min = float(min(T[1, 1] for T in global_window_poses))
+
+        kept = np.array(kept_positions) if len(kept_positions) > 0 else np.zeros((0, 3))
+        max_step = float(np.linalg.norm(np.diff(kept, axis=0), axis=1).max()) if len(kept) > 1 else 0.0
+
+        if heights is not None:
+            print(f"  [Diag] cam height above fitted floor (global frame, m): "
+                  f"mid={heights[mid_idx]:.3f} min={heights.min():.3f} max={heights.max():.3f} "
+                  f"(target={self.target_camera_height})")
+        else:
+            print(f"  [Diag] no floor plane fit this submap (conf={floor_conf:.3f})")
+        print(f"  [Diag] anchor_rot={anchor_deg:.2f}deg anchor_t={anchor_t:.3f}m | "
+              f"min R[1,1]={r11_min:.3f} | flips={len(flip_frames)} | "
+              f"max traj step this submap={max_step:.3f}m")
+
+        if self._run_dump_dir:
+            np.savez(
+                os.path.join(self._run_dump_dir, f"submap_{submap_idx:04d}.npz"),
+                frame_offset=frame_offset,
+                raw_poses=np.stack(raw_poses),
+                canonical_poses=np.stack(canonical_poses),
+                global_poses=np.stack(global_window_poses),
+                anchor_pose=anchor_pose,
+                floor_plane=np.array(floor_plane) if floor_plane is not None else np.full(4, np.nan),
+                floor_plane_global=plane_global if plane_global is not None else np.full(4, np.nan),
+                floor_scale=floor_scale if floor_scale is not None else np.nan,
+                floor_conf=floor_conf,
+                metric_scale=s,
+                target_camera_height=self.target_camera_height,
+                mid_idx=mid_idx,
+                window_size=self.window_size,
+                overlap=self.overlap,
+                cam_heights=heights if heights is not None else np.full(len(global_window_poses), np.nan),
+                flip_frames=np.array(flip_frames, dtype=np.int64),
+                kept_positions=kept,
+            )
+
     def process_sequence(self, frames, masks, window_size=16, overlap=4):
         self.window_size = window_size
         self.overlap = overlap
         self.reset()
-        
+
+        self._run_dump_dir = None
+        if self.debug_dump_dir:
+            self._run_dump_dir = os.path.join(self.debug_dump_dir, time.strftime("run_%Y%m%d_%H%M%S"))
+            os.makedirs(self._run_dump_dir, exist_ok=True)
+            print(f"[Diag] Dumping per-submap diagnostics to: {self._run_dump_dir}")
+            print(f"[Diag] Analyze with: python apps/diagnose_run.py {self._run_dump_dir}")
+
         num_frames = len(frames)
         t_seq_start = time.time()
         
@@ -202,9 +281,10 @@ class StreamingWindowEngine:
             # distance_threshold inside this function is a fixed value, so feeding it
             # already-rescaled points would make its effective real-world tolerance
             # drift as current_metric_scale changes across submaps.
-            floor_scale, floor_conf = estimate_metric_scale_from_floor(
+            floor_scale, floor_conf, floor_plane = estimate_metric_scale_from_floor(
                 pts_list[mid_idx],
-                target_camera_height=self.target_camera_height
+                target_camera_height=self.target_camera_height,
+                return_plane=True
             )
 
             if self.is_first_window:
@@ -261,24 +341,24 @@ class StreamingWindowEngine:
 
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             start_idx = 0 if self.is_first_window else self.overlap
-            
+
+            global_window_poses = []   # all window poses (incl. overlap), for diagnostics
+            flip_frames = []           # global frame indices where the TSDF flip fired
+            kept_positions = []        # trajectory points appended this submap
+
             for j in range(self.window_size):
                 global_pose = anchor_pose @ canonical_poses[j]
-                
+                global_window_poses.append(global_pose)
+
                 if j >= start_idx:
                     current_pos = global_pose[:3, 3]
 
                     tsdf_pose = global_pose.copy()
                     if tsdf_pose[1, 1] < 0:
+                        flip_frames.append(i + j)
                         print(f"  [FlipCheck] frame {i+j}: R[1,1]={global_pose[1,1]:.3f} -> "
                               f"applying 180deg flip to tsdf_pose only (trajectory pose left untouched)")
                         tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-
-                    if i == 0 and start_idx <= j < start_idx + 3:
-                        height_above_floor = current_pos[1]  # Y-down: floor is at +height
-                        print(f"  [Height] frame {i+j}: world_pos=({current_pos[0]:.3f}, "
-                              f"{current_pos[1]:.3f}, {current_pos[2]:.3f}) "
-                              f"-> trajectory 'height above floor' (z=-Y) = {-height_above_floor:.3f} m")
 
                     scaled_pts = pts_list[j] * self.current_metric_scale
                     depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
@@ -305,6 +385,7 @@ class StreamingWindowEngine:
 
                     if should_keyframe:
                         self.last_integrated_position = current_pos.copy()
+                        kept_positions.append(current_pos.copy())
 
                         self.trajectory.append(current_pos)
                         self.processed_indices.append(i + j)
@@ -322,6 +403,14 @@ class StreamingWindowEngine:
             
             self.prev_overlap_raw_pts = pts_list[-self.overlap:]
             self.is_first_window = False
+
+            self._report_submap_diagnostics(
+                submap_idx=self.submap_count, frame_offset=i,
+                raw_poses=poses, canonical_poses=canonical_poses,
+                global_window_poses=global_window_poses, anchor_pose=anchor_pose,
+                floor_plane=floor_plane, floor_scale=floor_scale, floor_conf=floor_conf,
+                mid_idx=mid_idx, flip_frames=flip_frames, kept_positions=kept_positions
+            )
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
             t3 = time.time()
@@ -367,6 +456,16 @@ class StreamingWindowEngine:
 
         print("\n==========================================")
         print(f"[Engine] Sequence Complete ({(time.time() - t_seq_start):.2f}s). Extracting Unified Global Mesh...")
+
+        if self._run_dump_dir:
+            np.savez(
+                os.path.join(self._run_dump_dir, "sequence.npz"),
+                trajectory=np.array(self.trajectory),
+                full_poses=np.stack(self.full_poses) if self.full_poses else np.zeros((0, 4, 4)),
+                processed_indices=np.array(self.processed_indices, dtype=np.int64),
+            )
+            print(f"[Diag] Run dump complete: {self._run_dump_dir}")
+
         final_mesh, final_pcd = self.get_full_map()
 
         yield final_mesh, final_pcd, np.array(self.trajectory), []

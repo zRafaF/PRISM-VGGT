@@ -3,18 +3,27 @@ import open3d as o3d
 from typing import Tuple, Optional
 
 def estimate_metric_scale_from_floor(
-    local_pts: np.ndarray, 
-    target_camera_height: float = 1.7, 
-    normal_tolerance_deg: float = 15.0, 
-    inlier_threshold: float = 0.3
-) -> Tuple[Optional[float], float]:
+    local_pts: np.ndarray,
+    target_camera_height: float = 1.7,
+    normal_tolerance_deg: float = 15.0,
+    inlier_threshold: float = 0.3,
+    return_plane: bool = False
+):
     """
     Finds the floor plane in the local camera point cloud to calculate absolute metric scale.
     Assumes OpenCV camera coordinate system (Y is DOWN).
-    
+
     Returns:
-        (scale_factor, confidence_score)
+        (scale_factor, confidence_score) by default.
+        If return_plane=True: (scale_factor, confidence_score, plane_model), where
+        plane_model is the raw RANSAC plane [a, b, c, d] in RAW (unscaled) local
+        coordinates (n·x + d = 0, |n| = 1), or None if no plane was fit. The plane
+        is returned even when the scale is rejected (wrong angle / low confidence)
+        so callers can log what RANSAC actually latched onto.
     """
+    def _ret(scale, conf, plane):
+        return (scale, conf, plane) if return_plane else (scale, conf)
+
     local_pts = local_pts.reshape(-1, 3)
     
     # Drop points originating from masked origin (0,0,0)
@@ -23,13 +32,13 @@ def estimate_metric_scale_from_floor(
     
     # Isolate lower hemisphere (Y > 0.1 in OpenCV space)
     lower_pts = local_pts[local_pts[:, 1] > 0.1]
-    
+
     if len(lower_pts) < 100:
-        return None, 0.0
+        return _ret(None, 0.0, None)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(lower_pts)
-    
+
     try:
         plane_model, inliers = pcd.segment_plane(
             distance_threshold=0.05,
@@ -37,7 +46,7 @@ def estimate_metric_scale_from_floor(
             num_iterations=200
         )
     except Exception:
-        return None, 0.0
+        return _ret(None, 0.0, None)
         
     a, b, c, d = plane_model
     normal = np.array([a, b, c])
@@ -53,9 +62,9 @@ def estimate_metric_scale_from_floor(
     if angle <= normal_tolerance_deg and confidence >= inlier_threshold:
         estimated_height = abs(d)
         if estimated_height < 0.1:
-            return None, confidence
-            
+            return _ret(None, confidence, plane_model)
+
         scale_factor = target_camera_height / estimated_height
-        return scale_factor, confidence
-        
-    return None, confidence
+        return _ret(scale_factor, confidence, plane_model)
+
+    return _ret(None, confidence, plane_model)
