@@ -196,19 +196,20 @@ class StreamingWindowEngine:
             
             t2 = time.time()
             mid_idx = self.window_size // 2
-            
-            # Pre-scale points before RANSAC Metrification
-            metric_pts_guess = pts_list[mid_idx] * self.current_metric_scale
-            
-            floor_scale_correction, floor_conf = estimate_metric_scale_from_floor(
-                metric_pts_guess, 
+
+            # Estimate absolute scale (raw VGGT units -> meters) from the floor plane
+            # in this window's RAW points. Must stay in raw units: the RANSAC
+            # distance_threshold inside this function is a fixed value, so feeding it
+            # already-rescaled points would make its effective real-world tolerance
+            # drift as current_metric_scale changes across submaps.
+            floor_scale, floor_conf = estimate_metric_scale_from_floor(
+                pts_list[mid_idx],
                 target_camera_height=self.target_camera_height
             )
-            
-            # --- FIX 2: Restored Scale Dampening ---
+
             if self.is_first_window:
-                if floor_scale_correction is not None:
-                    self.current_metric_scale = self.current_metric_scale * floor_scale_correction
+                if floor_scale is not None:
+                    self.current_metric_scale = floor_scale
                 else:
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
@@ -216,19 +217,18 @@ class StreamingWindowEngine:
                         self.current_metric_scale = 3.0 / np.median(valid_depths)
             else:
                 raw_scale_diff = align_cam_pts_irls(
-                    torch.from_numpy(pts_list[0].copy()), 
-                    torch.from_numpy(self.prev_overlap_raw_pts[0].copy()), 
+                    torch.from_numpy(pts_list[0].copy()),
+                    torch.from_numpy(self.prev_overlap_raw_pts[0].copy()),
                     torch.from_numpy(window_masks[0].copy())
                 )
                 clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
-                
+
                 # 80% memory / 20% new IRLS reading
                 relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
-                
-                if floor_scale_correction is not None and floor_conf > 0.4:
-                    absolute_floor_scale = self.current_metric_scale * floor_scale_correction
-                    # 90% running scale / 10% floor correction
-                    self.current_metric_scale = 0.9 * relative_scale + 0.1 * absolute_floor_scale
+
+                if floor_scale is not None and floor_conf > 0.4:
+                    # 90% running scale / 10% absolute floor-based scale
+                    self.current_metric_scale = 0.9 * relative_scale + 0.1 * floor_scale
                 else:
                     self.current_metric_scale = relative_scale
 
@@ -259,42 +259,46 @@ class StreamingWindowEngine:
                 
                 if j >= start_idx:
                     current_pos = global_pose[:3, 3]
-                    
-                    # --- FIX 1 (cont): Spatial Keyframing Logic ---
-                    should_integrate = False
+
+                    tsdf_pose = global_pose.copy()
+                    if tsdf_pose[1, 1] < 0:
+                        tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+
+                    scaled_pts = pts_list[j] * self.current_metric_scale
+                    depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
+
+                    # Always integrate every processed frame into the TSDF, even if the
+                    # camera hasn't moved. A stationary camera can still see moving
+                    # objects (e.g. someone walking through the scene), and nvblox
+                    # needs continuous integration to update/clear those voxels.
+                    batch_depths.append(depth_map)
+                    batch_rgbs.append(window_frames[j])
+                    batch_masks.append(window_masks[j])
+                    batch_poses.append(tsdf_pose)
+
+                    # Trajectory dots and coloring keyframes are spatially decimated
+                    # so they don't pile up near-duplicate entries while the camera
+                    # is stationary.
+                    should_keyframe = False
                     if self.last_integrated_position is None:
-                        should_integrate = True
+                        should_keyframe = True
                     else:
                         dist = np.linalg.norm(current_pos - self.last_integrated_position)
                         if dist >= self.min_translation_m:
-                            should_integrate = True
+                            should_keyframe = True
 
-                    if should_integrate:
+                    if should_keyframe:
                         self.last_integrated_position = current_pos.copy()
-                        
-                        # Only append to trajectory if it passes the distance threshold 
+
                         self.trajectory.append(current_pos)
                         self.processed_indices.append(i + j)
                         self.full_poses.append(global_pose)
-                        
-                        tsdf_pose = global_pose.copy()
-                        
-                        if tsdf_pose[1, 1] < 0:
-                            tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
 
-                        scaled_pts = pts_list[j] * self.current_metric_scale
-                        depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
-                        
-                        batch_depths.append(depth_map)
-                        batch_rgbs.append(window_frames[j])
-                        batch_masks.append(window_masks[j])
-                        batch_poses.append(tsdf_pose) 
-                        
                         self.kf_depths.append(depth_map)
                         self.kf_rgbs.append(window_frames[j])
                         self.kf_masks.append(window_masks[j])
-                        self.kf_poses.append(tsdf_pose) 
-                    
+                        self.kf_poses.append(tsdf_pose)
+
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
                         self.prev_overlap_global_poses = []
