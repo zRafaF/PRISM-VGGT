@@ -270,7 +270,15 @@ class StreamingWindowEngine:
 
                     tsdf_pose = global_pose.copy()
                     if tsdf_pose[1, 1] < 0:
+                        print(f"  [FlipCheck] frame {i+j}: R[1,1]={global_pose[1,1]:.3f} -> "
+                              f"applying 180deg flip to tsdf_pose only (trajectory pose left untouched)")
                         tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+
+                    if i == 0 and start_idx <= j < start_idx + 3:
+                        height_above_floor = current_pos[1]  # Y-down: floor is at +height
+                        print(f"  [Height] frame {i+j}: world_pos=({current_pos[0]:.3f}, "
+                              f"{current_pos[1]:.3f}, {current_pos[2]:.3f}) "
+                              f"-> trajectory 'height above floor' (z=-Y) = {-height_above_floor:.3f} m")
 
                     scaled_pts = pts_list[j] * self.current_metric_scale
                     depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
