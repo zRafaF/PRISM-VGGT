@@ -12,13 +12,32 @@ from prism_vggt.utils.masking import get_spherical_valid_mask
 from prism_vggt.utils.visualization import visualize_polar_mask, visualize_depth
 from prism_vggt.utils.geometry import unproject_equirectangular_to_points
 
+# =============================================================================
+# CONFIG DEFAULTS
+# Edit these to change the UI's starting values without digging through the
+# Gradio layout below.
+# =============================================================================
+CONFIG_DEFAULTS = {
+    "step_size": 14,
+    "target_width": 1036,
+    "target_height": 518,
+    "zenith_limit": 75,
+    "nadir_limit": -70,
+    "window_size": 12,
+    "overlap": 3,
+    "voxel_size": 0.02,
+    "max_depth": 4.5,
+    "camera_height": 1.7,
+    "keyframe_dist": 0.10,
+}
+
 print("[UI] Initializing Architecture Stack...")
 perception = PanoVGGTBackend(weights_path="checkpoints/model.pt")
 streaming_engine = StreamingWindowEngine(
-    perception=perception, 
-    voxel_size=0.02, 
-    max_depth=4.5, 
-    target_camera_height=1.5
+    perception=perception,
+    voxel_size=CONFIG_DEFAULTS["voxel_size"],
+    max_depth=CONFIG_DEFAULTS["max_depth"],
+    target_camera_height=CONFIG_DEFAULTS["camera_height"]
 )
 
 backend_state = {"frames": [], "mesh": None}
@@ -169,27 +188,27 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
 
             gr.Markdown("### Processing Controls")
             with gr.Row():
-                step_size = gr.Number(value=14, label="Step Size")
+                step_size = gr.Number(value=CONFIG_DEFAULTS["step_size"], label="Step Size")
                 link_ratio = gr.Checkbox(value=True, label="Link Aspect Ratio")
 
-            target_width = gr.Slider(minimum=224, maximum=4096, value=1036, step=1, label="Target Width")
-            target_height = gr.Slider(minimum=112, maximum=2048, value=518, step=1, label="Target Height")
-            
+            target_width = gr.Slider(minimum=224, maximum=4096, value=CONFIG_DEFAULTS["target_width"], step=1, label="Target Width")
+            target_height = gr.Slider(minimum=112, maximum=2048, value=CONFIG_DEFAULTS["target_height"], step=1, label="Target Height")
+
             gr.Markdown("### Polar Exclusion Limits")
-            zenith_slider = gr.Slider(minimum=0, maximum=90, value=75, step=1, label="Zenith Limit")
-            nadir_slider = gr.Slider(minimum=-90, maximum=0, value=-60, step=1, label="Nadir Limit")
+            zenith_slider = gr.Slider(minimum=0, maximum=90, value=CONFIG_DEFAULTS["zenith_limit"], step=1, label="Zenith Limit")
+            nadir_slider = gr.Slider(minimum=-90, maximum=0, value=CONFIG_DEFAULTS["nadir_limit"], step=1, label="Nadir Limit")
 
             gr.Markdown("### Submap Configuration (SLAM)")
-            window_size_slider = gr.Slider(minimum=3, maximum=32, value=16, step=1, label="Submap Window Size")
-            overlap_slider = gr.Slider(minimum=2, maximum=8, value=4, step=1, label="Submap Overlap")
-            
+            window_size_slider = gr.Slider(minimum=3, maximum=32, value=CONFIG_DEFAULTS["window_size"], step=1, label="Submap Window Size")
+            overlap_slider = gr.Slider(minimum=2, maximum=8, value=CONFIG_DEFAULTS["overlap"], step=1, label="Submap Overlap")
+
             gr.Markdown("### 🧠 Nvblox Dense GPU Parameters")
-            voxel_size_slider = gr.Slider(minimum=0.01, maximum=0.10, value=0.02, step=0.01, label="Voxel Resolution (m) [Lower = Denser]")
-            max_depth_slider = gr.Slider(minimum=2.0, maximum=15.0, value=4.5, step=0.5, label="Max Depth Ray Cutoff (m)")
-            camera_height_slider = gr.Slider(minimum=0.1, maximum=3.0, value=1.5, step=0.1, label="Target Camera Height (m)")
-            
+            voxel_size_slider = gr.Slider(minimum=0.01, maximum=0.10, value=CONFIG_DEFAULTS["voxel_size"], step=0.01, label="Voxel Resolution (m) [Lower = Denser]")
+            max_depth_slider = gr.Slider(minimum=2.0, maximum=15.0, value=CONFIG_DEFAULTS["max_depth"], step=0.5, label="Max Depth Ray Cutoff (m)")
+            camera_height_box = gr.Textbox(value=str(CONFIG_DEFAULTS["camera_height"]), label="Target Camera Height (m)")
+
             # --- FIX: Reinstated Keyframe Distance Slider ---
-            keyframe_dist_slider = gr.Slider(minimum=0.05, maximum=1.0, value=0.10, step=0.05, label="Keyframe Stamp Distance (m)")
+            keyframe_dist_slider = gr.Slider(minimum=0.05, maximum=1.0, value=CONFIG_DEFAULTS["keyframe_dist"], step=0.05, label="Keyframe Stamp Distance (m)")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -241,7 +260,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
         inputs=[
             input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, 
             target_width, target_height, window_size_slider, overlap_slider, 
-            max_depth_slider, voxel_size_slider, camera_height_slider, keyframe_dist_slider, live_stream_checkbox
+            max_depth_slider, voxel_size_slider, camera_height_box, keyframe_dist_slider, live_stream_checkbox
         ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh]
     )
