@@ -28,6 +28,18 @@ class StreamingWindowEngine:
         self.color_cam_batch = 8
         self.color_point_chunk = 500_000
 
+        # --- nvblox VRAM bounding ---------------------------------------------
+        # The nvblox TSDF volume grows with explored area; on a streaming run it
+        # eventually exhausts VRAM when its block hash doubles. To keep ALL the
+        # geometry while capping GPU memory, we periodically "flush": extract +
+        # color the current volume, append it to a persistent CPU accumulator, then
+        # clear the GPU volume (and the per-window keyframe buffers). The full map
+        # therefore lives on the CPU; the GPU only ever holds one flush-window.
+        self.map_accumulate = True
+        self.map_flush_every_n = 3          # flush after this many submaps...
+        self.map_flush_min_free_gb = 3.0    # ...or sooner if free VRAM drops below this
+        self.accum_downsample = True        # voxel-downsample the accumulated cloud (dedup overlaps)
+
         # Minimum |cos(normal . up)| required to trust a floor detection for the
         # one-time gravity leveling of the world frame.
         self.level_min_confidence = 0.4
@@ -47,7 +59,14 @@ class StreamingWindowEngine:
 
         self.last_mesh = None
         self.last_pcd = None
-            
+
+        # Persistent CPU-side accumulation of the full colored map (see map flush).
+        # accum_mesh keeps the full mesh; accum_pcd_cache is its (downsampled) point
+        # cloud, rebuilt only on flush so per-submap display stays cheap.
+        self.accum_mesh = o3d.geometry.TriangleMesh()
+        self.accum_pcd_cache = o3d.geometry.PointCloud()
+        self.last_flush_submap = 0
+
         self.tsdf = NvbloxPanoTSDF(
             voxel_size_m=self.voxel_size, 
             max_depth=self.max_depth, 
@@ -170,6 +189,83 @@ class StreamingWindowEngine:
             del imgs_t, depths_t, masks_t, poses_t, R_w_c, t_w_c
 
         return final_colors.cpu().numpy()
+
+    @staticmethod
+    def _free_vram_gb():
+        if not torch.cuda.is_available():
+            return float("inf")
+        free, _ = torch.cuda.mem_get_info()
+        return free / (1024 ** 3)
+
+    def _color_geometry(self, geometry):
+        """Colorize an already-extracted volume mesh in place (vertices = point
+        cloud). Returns the colored mesh, or the input unchanged if empty."""
+        if geometry is None or len(geometry.vertices) == 0 or len(self.kf_rgbs) == 0:
+            return geometry
+        geometry.compute_vertex_normals()
+        colors = self._apply_pytorch_colors(
+            np.asarray(geometry.vertices),
+            np.asarray(geometry.vertex_normals),
+            self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
+        )
+        geometry.vertex_colors = o3d.utility.Vector3dVector(colors)
+        return geometry
+
+    def _extract_and_color_current(self):
+        """Extract the current nvblox volume and colorize it (used at sequence end)."""
+        return self._color_geometry(self.tsdf.extract_geometry())
+
+    @staticmethod
+    def _mesh_to_valid_pcd(mesh):
+        """Point cloud of a colored mesh's vertices, keeping only colored ones."""
+        pcd = o3d.geometry.PointCloud()
+        if mesh is None or len(mesh.vertices) == 0:
+            return pcd
+        verts = np.asarray(mesh.vertices)
+        cols = np.asarray(mesh.vertex_colors) if len(mesh.vertex_colors) else np.zeros_like(verts)
+        valid = cols.sum(axis=1) > 0.0
+        pcd.points = o3d.utility.Vector3dVector(verts[valid])
+        pcd.colors = o3d.utility.Vector3dVector(cols[valid])
+        return pcd
+
+    def _flush_to_accumulator(self, colored_mesh):
+        """Append a colored volume to the persistent CPU map, then free the GPU
+        volume and the per-window keyframe buffers so VRAM stays bounded."""
+        if colored_mesh is not None and len(colored_mesh.vertices) > 0:
+            self.accum_mesh += colored_mesh
+
+        # Rebuild the cached accumulator point cloud (only happens on flush).
+        self.accum_pcd_cache = self._mesh_to_valid_pcd(self.accum_mesh)
+        if self.accum_downsample and self.voxel_size > 0 and len(self.accum_pcd_cache.points) > 0:
+            self.accum_pcd_cache = self.accum_pcd_cache.voxel_down_sample(self.voxel_size)
+
+        # Release GPU TSDF blocks and per-window keyframes.
+        self.tsdf.mapper.clear()
+        self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses = [], [], [], []
+        self.last_flush_submap = self.submap_count + 1
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _build_display(self, current_mesh):
+        """Cheap per-submap display: cached (frozen) accumulator cloud + the current
+        live window. The live mesh is just the current window; the full map is always
+        present in the point cloud."""
+        display_mesh = current_mesh if (current_mesh is not None and len(current_mesh.vertices) > 0) else o3d.geometry.TriangleMesh()
+
+        pts, cols = [], []
+        if len(self.accum_pcd_cache.points) > 0:
+            pts.append(np.asarray(self.accum_pcd_cache.points))
+            cols.append(np.asarray(self.accum_pcd_cache.colors))
+        cur_pcd = self._mesh_to_valid_pcd(current_mesh)
+        if len(cur_pcd.points) > 0:
+            pts.append(np.asarray(cur_pcd.points))
+            cols.append(np.asarray(cur_pcd.colors))
+
+        display_pcd = o3d.geometry.PointCloud()
+        if pts:
+            display_pcd.points = o3d.utility.Vector3dVector(np.concatenate(pts, axis=0))
+            display_pcd.colors = o3d.utility.Vector3dVector(np.concatenate(cols, axis=0))
+        return display_mesh, display_pcd
 
     def process_sequence(self, frames, masks, window_size=16, overlap=4):
         self.window_size = window_size
@@ -358,60 +454,67 @@ class StreamingWindowEngine:
             current_geometry = self.tsdf.extract_geometry()
             profiler["Geometry_Extraction"] = time.time() - t_extract
 
-            # Coloring is a separate, heavy pass - profiled independently.
+            # Coloring runs EVERY submap (separate, heavy pass - profiled on its own).
             t_color = time.time()
-            if self.submap_count % 3 == 0:
-                self.last_mesh = current_geometry
-                self.last_pcd = o3d.geometry.PointCloud()
-
-                if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
-                    self.last_mesh.compute_vertex_normals()
-                    colored_vertices = self._apply_pytorch_colors(
-                        np.asarray(self.last_mesh.vertices),
-                        np.asarray(self.last_mesh.vertex_normals),
-                        self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
-                    )
-                    self.last_mesh.vertex_colors = o3d.utility.Vector3dVector(colored_vertices)
-
-                    valid_color_mask = colored_vertices.sum(axis=1) > 0.0
-                    self.last_pcd.points = o3d.utility.Vector3dVector(np.asarray(self.last_mesh.vertices)[valid_color_mask])
-                    self.last_pcd.colors = o3d.utility.Vector3dVector(colored_vertices[valid_color_mask])
-
+            self.last_mesh = self._color_geometry(current_geometry)
             profiler["Coloring"] = time.time() - t_color
+
+            # --- Flush the GPU volume to the CPU accumulator if needed ----------
+            # This is what actually bounds nvblox VRAM: once we've extracted and
+            # colored the current volume, we can push it to the CPU map and clear
+            # the GPU so the block hash never has to grow without limit.
+            free_gb = self._free_vram_gb()
+            submaps_since_flush = (self.submap_count + 1) - self.last_flush_submap
+            need_flush = self.map_accumulate and (
+                submaps_since_flush >= self.map_flush_every_n or free_gb < self.map_flush_min_free_gb
+            )
+            if need_flush:
+                self._flush_to_accumulator(self.last_mesh)
+                current_for_display = None
+                print(f"  > [Map] Flushed volume to CPU accumulator (free VRAM was {free_gb:.2f} GB).")
+            else:
+                current_for_display = self.last_mesh
+
+            display_mesh, display_pcd = self._build_display(current_for_display)
+            self.last_pcd = display_pcd
 
             gc.collect()
             torch.cuda.empty_cache()
 
             pt_alloc, pt_res, sys_used, sys_total = self.vram_tracker.stop()
+            nvblox_other = max(sys_used - pt_res, 0.0)
             print("  --- ⏱️ Process Timing (Seconds) ---")
             for k, v in profiler.items():
                 print(f"    - {k:<20}: {v:.3f}s")
             print(f"    = Total Submap Time   : {(time.time() - t_win_start):.3f}s")
-            
+
             print("  --- 💾 GPU Memory (VRAM) ---")
             print(f"    - PyTorch Peak Alloc  : {pt_alloc:.2f} GB")
+            print(f"    - PyTorch Reserved    : {pt_res:.2f} GB")
+            print(f"    - nvblox / Other      : {nvblox_other:.2f} GB")
             print(f"    - System VRAM Usage   : {sys_used:.2f} GB / {sys_total:.2f} GB")
+            print(f"    - Accumulated Verts   : {len(self.accum_mesh.vertices)}")
             self.submap_count += 1
 
-            yield_mesh = self.last_mesh if self.last_mesh else o3d.geometry.TriangleMesh()
-            yield_pcd = self.last_pcd if self.last_pcd else o3d.geometry.PointCloud()
-            yield yield_mesh, yield_pcd, np.array(self.trajectory), self.last_floor_plane
+            yield display_mesh, display_pcd, np.array(self.trajectory), self.last_floor_plane
 
         if self.tsdf_future is not None:
             self.tsdf_future.result()
 
         print("\n==========================================")
         print(f"[Engine] Sequence Complete ({(time.time() - t_seq_start):.2f}s). Extracting Unified Global Point Cloud...")
-        final_mesh = self.tsdf.extract_geometry()
+
+        # Fold any geometry still on the GPU into the accumulator, then the full map
+        # is simply the CPU accumulator.
+        tail_mesh = self._extract_and_color_current()
+        if tail_mesh is not None and len(tail_mesh.vertices) > 0:
+            self.accum_mesh += tail_mesh
+
+        final_mesh = self.accum_mesh
         final_pcd = o3d.geometry.PointCloud()
-        
+
         if final_mesh is not None and len(final_mesh.vertices) > 0:
-            final_mesh.compute_vertex_normals()
-            final_colors = self._apply_pytorch_colors(
-                np.asarray(final_mesh.vertices), np.asarray(final_mesh.vertex_normals),
-                self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
-            )
-            final_mesh.vertex_colors = o3d.utility.Vector3dVector(final_colors)
+            final_colors = np.asarray(final_mesh.vertex_colors) if len(final_mesh.vertex_colors) else np.zeros((len(final_mesh.vertices), 3))
             
             valid_color_mask = final_colors.sum(axis=1) > 0.0
             final_pcd.points = o3d.utility.Vector3dVector(np.asarray(final_mesh.vertices)[valid_color_mask])
