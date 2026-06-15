@@ -631,22 +631,22 @@ class StreamingWindowEngine:
                 torch.cuda.synchronize()
                 profiler["Mesh_MarchingCubes"] = time.time() - t0
 
+                # Only vertices + triangles are needed: the colorizer below overwrites
+                # vertex colors, so we skip pulling/building nvblox's default colors.
                 t0 = time.time()
                 cmesh = self.tsdf.get_color_mesh_raw()
-                v_t, c_t, tri_t = cmesh.vertices(), cmesh.vertex_colors(), cmesh.triangles()
+                v_t, tri_t = cmesh.vertices(), cmesh.triangles()
                 torch.cuda.synchronize()
                 profiler["Mesh_GetHandles"] = time.time() - t0
 
                 t0 = time.time()
                 v_np = v_t.cpu().numpy()
-                c_np = (c_t.to(torch.float64) / 255.0).cpu().numpy()
                 tri_np = tri_t.cpu().numpy()
                 profiler["Mesh_GPU2CPU"] = time.time() - t0
 
                 t0 = time.time()
                 current_geometry = o3d.geometry.TriangleMesh()
                 current_geometry.vertices = o3d.utility.Vector3dVector(v_np)
-                current_geometry.vertex_colors = o3d.utility.Vector3dVector(c_np)
                 current_geometry.triangles = o3d.utility.Vector3iVector(tri_np)
                 profiler["Mesh_O3D_Build"] = time.time() - t0
 
