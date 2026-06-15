@@ -9,7 +9,7 @@ from .tsdf import NvbloxPanoTSDF
 from .perception_base import BasePerceptionExtractor
 
 from .utils.alignment import align_cam_pts_irls
-from .utils.geometry import register_camera_poses_kabsch, rotation_aligning_vectors
+from .utils.geometry import register_camera_poses_kabsch, register_camera_poses_sim3, rotation_aligning_vectors
 from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
@@ -51,6 +51,13 @@ class StreamingWindowEngine:
         # Dump nvblox's internal C++ stage timers every N submaps (0 = off). These
         # give the library's own per-stage breakdown (integration, meshing, ...).
         self.nvblox_timing_every = 0
+
+        # --- Mesh extraction cadence ------------------------------------------
+        # Depth is integrated every submap, but pulling + rebuilding the full
+        # Open3D mesh scales with TOTAL map size and dominates once the map grows.
+        # Only rebuild the display mesh every N submaps; nvblox's incremental
+        # marching cubes catches up on the next extraction. 1 = every submap.
+        self.mesh_extract_every = 1
 
         # --- nvblox VRAM bounding ---------------------------------------------
         # The nvblox TSDF volume grows with explored area; on a streaming run it
@@ -463,74 +470,70 @@ class StreamingWindowEngine:
                 target_camera_height=self.target_camera_height
             )
             
-            # --- FIX 2: Restored Scale Dampening ---
-            if self.is_first_window:
-                if floor_scale is not None:
-                    self.current_metric_scale = floor_scale
-                else:
-                    first_depth = np.linalg.norm(pts_list[0], axis=-1)
-                    valid_depths = first_depth[first_depth > 0.1]
-                    if len(valid_depths) > 0:
-                        self.current_metric_scale = 3.0 / np.median(valid_depths)
-            else:
-                raw_scale_diff = align_cam_pts_irls(
-                    torch.from_numpy(pts_list[0].copy()), 
-                    torch.from_numpy(self.prev_overlap_raw_pts[0].copy()), 
-                    torch.from_numpy(window_masks[0].copy())
-                )
-                clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
-                
-                # 80% memory / 20% new IRLS reading
-                relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
-                
-                if floor_scale is not None and floor_conf > 0.4:
-                    absolute_floor_scale = floor_scale
-                    # 90% running scale / 10% floor correction
-                    self.current_metric_scale = 0.9 * relative_scale + 0.1 * absolute_floor_scale
-                else:
-                    self.current_metric_scale = relative_scale
+            # --- Native (unscaled) canonical poses: first cam at identity --------
+            # All scale + placement now comes from a single Sim3 anchor estimated
+            # from the overlap (below), so per-submap poses stay in VGGT native units.
+            origin_inv = np.linalg.inv(poses[0])
+            canonical_native = [origin_inv @ p for p in poses]
 
-            self.current_metric_scale = np.clip(self.current_metric_scale, 0.1, 5.0)
-
-            metric_local_poses = []
-            for p in poses:
-                mp = p.copy()
-                mp[:3, 3] *= self.current_metric_scale 
-                metric_local_poses.append(mp)
-                
-            submap_origin_inv = np.linalg.inv(metric_local_poses[0])
-            canonical_poses = [submap_origin_inv @ mp for mp in metric_local_poses]
-
-            # --- Gravity leveling (one-time) ---------------------------------
-            # On the first window with a confident floor, rotate the world frame so
-            # the detected floor normal points along world "up" (-Y, OpenCV down
-            # convention). This is baked into every pose below, so nvblox builds the
-            # whole map level. Subsequent windows inherit it via Kabsch anchoring.
+            # --- Gravity leveling (one-time, first confident floor) --------------
+            # Rotate the world frame so the detected floor normal points along world
+            # "up" (-Y, OpenCV down). Baked into the anchor below so nvblox builds the
+            # whole map level; later windows inherit it via the already-leveled poses.
             if self.is_first_window and not self.is_leveled and floor_plane is not None and floor_conf >= self.level_min_confidence:
                 n_local = floor_plane["normal"]
-                n_canonical = canonical_poses[mid_idx][:3, :3] @ n_local
+                n_canonical = canonical_native[mid_idx][:3, :3] @ n_local
                 R_level = rotation_aligning_vectors(n_canonical, np.array([0.0, -1.0, 0.0]))
                 self.world_align = np.eye(4)
                 self.world_align[:3, :3] = R_level
                 self.is_leveled = True
                 print(f"  > [Leveling] World frame aligned to floor (conf={floor_conf:.2f}).")
 
-            # The leveling rotation only needs to be applied explicitly to the very
-            # first window; later windows are anchored to already-leveled global poses.
-            base = self.world_align if self.is_first_window else np.eye(4)
-
-            anchor_pose = np.eye(4)
-            if not self.is_first_window:
-                src_cam_np = np.stack(canonical_poses[:self.overlap])
+            # --- Sim3 anchor (s, R, t): native submap frame -> world meters ------
+            if self.is_first_window:
+                # First submap defines absolute metric scale from the floor (fallback
+                # to a median-depth guess); the leveling rotation orients it upright.
+                if floor_scale is not None:
+                    s_anchor = floor_scale
+                else:
+                    first_depth = np.linalg.norm(pts_list[0], axis=-1)
+                    valid_depths = first_depth[first_depth > 0.1]
+                    s_anchor = (3.0 / np.median(valid_depths)) if len(valid_depths) > 0 else 1.0
+                R_anchor = self.world_align[:3, :3].copy()
+                t_anchor = self.world_align[:3, 3].copy()
+            else:
+                # Jointly estimate scale + rotation + translation from the overlap
+                # cameras (proper Sim3). The world is already metric (inherited through
+                # the chain), so the Umeyama scale lands directly in meters - no
+                # damping / clamp heuristics needed.
+                src_cam_np = np.stack(canonical_native[:self.overlap])
                 tgt_cam_np = np.stack(self.prev_overlap_global_poses)
-                R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
-                anchor_pose[:3, :3] = R_align
-                anchor_pose[:3, 3] = t_align
+                s_est, R_anchor, t_anchor, src_ctr, tgt_ctr = register_camera_poses_sim3(src_cam_np, tgt_cam_np)
+                if s_est is None:
+                    # Degenerate baseline (camera barely moved across the overlap):
+                    # keep the previous metric scale rather than inventing one.
+                    s_est = self.current_metric_scale
+                # Light absolute pull toward the floor scale to curb slow drift.
+                if floor_scale is not None and floor_conf > 0.4:
+                    s_est = 0.9 * s_est + 0.1 * floor_scale
+                s_anchor = float(np.clip(s_est, 0.1, 5.0))
+                # Keep translation consistent with the final (blended/clipped) scale.
+                t_anchor = tgt_ctr - s_anchor * (R_anchor @ src_ctr)
+
+            self.current_metric_scale = s_anchor
+
+            def _to_world(cn):
+                gp = np.eye(4)
+                gp[:3, :3] = R_anchor @ cn[:3, :3]
+                gp[:3, 3] = s_anchor * (R_anchor @ cn[:3, 3]) + t_anchor
+                return gp
+
+            global_poses = [_to_world(cn) for cn in canonical_native]
 
             # Record the detected floor plane in (leveled) world coordinates so the UI
             # can render the exact plane that was found this submap.
             if floor_plane is not None and floor_conf >= self.level_min_confidence:
-                global_pose_mid = base @ anchor_pose @ canonical_poses[mid_idx]
+                global_pose_mid = global_poses[mid_idx]
                 centroid_metric = floor_plane["centroid"] * self.current_metric_scale
                 extent_metric = floor_plane["extent"] * self.current_metric_scale
                 normal_world = global_pose_mid[:3, :3] @ floor_plane["normal"]
@@ -545,7 +548,7 @@ class StreamingWindowEngine:
             start_idx = 0 if self.is_first_window else self.overlap
             
             for j in range(self.window_size):
-                global_pose = base @ anchor_pose @ canonical_poses[j]
+                global_pose = global_poses[j]
 
                 if j >= start_idx:
                     # Low-frequency capture (2-3 Hz): keep EVERY frame. No spatial
@@ -615,66 +618,72 @@ class StreamingWindowEngine:
                 self.tsdf_future.result()
                 self.tsdf_future = None
 
-            # --- Geometry extraction, split into its real sub-costs --------------
-            # 1) marching cubes (incremental in nvblox), 2) pulling the full mesh
-            # tensors GPU->CPU, 3) building the Open3D object. (2)+(3) copy the whole
-            # growing mesh every submap, so this is where we expect any growth.
-            t0 = time.time()
-            self.tsdf.update_mesh()
-            torch.cuda.synchronize()
-            profiler["Mesh_MarchingCubes"] = time.time() - t0
+            # --- Geometry extraction (gated by cadence) --------------------------
+            # The costly part (pulling + rebuilding the full Open3D mesh) scales with
+            # TOTAL map size, so only do it every ``mesh_extract_every`` submaps.
+            # Depth was already integrated this submap (above); nvblox re-meshes every
+            # block dirtied since the last update on the next extraction.
+            do_extract = (self.submap_count % max(1, int(self.mesh_extract_every)) == 0)
+            if do_extract:
+                # 1) marching cubes (incremental), 2) GPU->CPU pull, 3) o3d build.
+                t0 = time.time()
+                self.tsdf.update_mesh()
+                torch.cuda.synchronize()
+                profiler["Mesh_MarchingCubes"] = time.time() - t0
 
-            t0 = time.time()
-            cmesh = self.tsdf.get_color_mesh_raw()
-            v_t, c_t, tri_t = cmesh.vertices(), cmesh.vertex_colors(), cmesh.triangles()
-            torch.cuda.synchronize()
-            profiler["Mesh_GetHandles"] = time.time() - t0
+                t0 = time.time()
+                cmesh = self.tsdf.get_color_mesh_raw()
+                v_t, c_t, tri_t = cmesh.vertices(), cmesh.vertex_colors(), cmesh.triangles()
+                torch.cuda.synchronize()
+                profiler["Mesh_GetHandles"] = time.time() - t0
 
-            t0 = time.time()
-            v_np = v_t.cpu().numpy()
-            c_np = (c_t.to(torch.float64) / 255.0).cpu().numpy()
-            tri_np = tri_t.cpu().numpy()
-            profiler["Mesh_GPU2CPU"] = time.time() - t0
+                t0 = time.time()
+                v_np = v_t.cpu().numpy()
+                c_np = (c_t.to(torch.float64) / 255.0).cpu().numpy()
+                tri_np = tri_t.cpu().numpy()
+                profiler["Mesh_GPU2CPU"] = time.time() - t0
 
-            t0 = time.time()
-            current_geometry = o3d.geometry.TriangleMesh()
-            current_geometry.vertices = o3d.utility.Vector3dVector(v_np)
-            current_geometry.vertex_colors = o3d.utility.Vector3dVector(c_np)
-            current_geometry.triangles = o3d.utility.Vector3iVector(tri_np)
-            profiler["Mesh_O3D_Build"] = time.time() - t0
+                t0 = time.time()
+                current_geometry = o3d.geometry.TriangleMesh()
+                current_geometry.vertices = o3d.utility.Vector3dVector(v_np)
+                current_geometry.vertex_colors = o3d.utility.Vector3dVector(c_np)
+                current_geometry.triangles = o3d.utility.Vector3iVector(tri_np)
+                profiler["Mesh_O3D_Build"] = time.time() - t0
 
-            # Per-vertex normals (o3d, CPU) run over the whole mesh -> can grow with
-            # map size, so profile it apart from the bounded projection cost.
-            t0 = time.time()
-            current_geometry.compute_vertex_normals()
-            profiler["Mesh_Normals"] = time.time() - t0
+                # Per-vertex normals (o3d, CPU) over the whole mesh -> profile apart.
+                t0 = time.time()
+                current_geometry.compute_vertex_normals()
+                profiler["Mesh_Normals"] = time.time() - t0
 
-            t_color = time.time()
-            # Color against THIS window's frames only; the persistent cache supplies
-            # colors for everything outside the live region (bounded per-submap cost).
-            self.last_mesh = self._color_geometry(
-                current_geometry, batch_rgbs, batch_depths, batch_masks, batch_poses
-            )
-            profiler["Coloring"] = time.time() - t_color
+                t_color = time.time()
+                # Color against THIS window's frames only; the persistent cache supplies
+                # colors outside the live region (bounded per-submap cost).
+                self.last_mesh = self._color_geometry(
+                    current_geometry, batch_rgbs, batch_depths, batch_masks, batch_poses
+                )
+                profiler["Coloring"] = time.time() - t_color
 
-            # --- Flush the GPU volume to the CPU accumulator if needed ----------
-            # This is what actually bounds nvblox VRAM: once we've extracted and
-            # colored the current volume, we can push it to the CPU map and clear
-            # the GPU so the block hash never has to grow without limit.
-            free_gb = self._free_vram_gb()
-            submaps_since_flush = (self.submap_count + 1) - self.last_flush_submap
-            need_flush = self.map_accumulate and (
-                submaps_since_flush >= self.map_flush_every_n or free_gb < self.map_flush_min_free_gb
-            )
-            if need_flush:
-                self._flush_to_accumulator(self.last_mesh)
-                current_for_display = None
-                print(f"  > [Map] Flushed volume to CPU accumulator (free VRAM was {free_gb:.2f} GB).")
+                # --- Flush the GPU volume to the CPU accumulator if needed ------
+                free_gb = self._free_vram_gb()
+                submaps_since_flush = (self.submap_count + 1) - self.last_flush_submap
+                need_flush = self.map_accumulate and (
+                    submaps_since_flush >= self.map_flush_every_n or free_gb < self.map_flush_min_free_gb
+                )
+                if need_flush:
+                    self._flush_to_accumulator(self.last_mesh)
+                    current_for_display = None
+                    print(f"  > [Map] Flushed volume to CPU accumulator (free VRAM was {free_gb:.2f} GB).")
+                else:
+                    current_for_display = self.last_mesh
+
+                display_mesh, display_pcd = self._build_display(current_for_display)
+                self.last_pcd = display_pcd
             else:
-                current_for_display = self.last_mesh
-
-            display_mesh, display_pcd = self._build_display(current_for_display)
-            self.last_pcd = display_pcd
+                # Cadence skip: reuse the last extracted/colored geometry. Depth is
+                # still integrated; the displayed map refreshes on the next extract.
+                profiler["Mesh_Skipped(cadence)"] = 0.0
+                display_mesh = self.last_mesh if (self.last_mesh is not None and len(self.last_mesh.vertices) > 0) else o3d.geometry.TriangleMesh()
+                display_pcd = self.last_pcd if self.last_pcd is not None else o3d.geometry.PointCloud()
 
             gc.collect()
             torch.cuda.empty_cache()

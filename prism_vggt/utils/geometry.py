@@ -99,5 +99,57 @@ def register_camera_poses_kabsch(src_cam_poses: np.ndarray, tgt_cam_poses: np.nd
 
     # Translation offset
     t = tgt_centroid - R @ src_centroid
-    
+
     return R, t
+
+
+def register_camera_poses_sim3(src_cam_poses: np.ndarray, tgt_cam_poses: np.ndarray, min_spread: float = 1e-6):
+    """Estimate a similarity transform (Sim3) aligning src camera poses to tgt.
+
+    Maps src -> tgt for the camera centers as ``p_tgt ~= s * R @ p_src + t`` (the
+    camera orientation is additionally rotated by R). Unlike a decoupled SE(3) anchor
+    plus a separate global scale heuristic, this jointly estimates rotation,
+    translation AND the relative scale directly from the overlapping cameras.
+
+    - ``s`` is the Umeyama least-squares optimal scale given R (positions only).
+    - ``R`` is estimated from centered positions AUGMENTED with the camera
+      orientation axes, so it stays well-conditioned even for short, near-collinear
+      overlap snippets (same trick as the Kabsch variant).
+
+    Returns ``(s, R, t, src_centroid, tgt_centroid)``. ``s`` is ``None`` when the
+    camera baseline is too small to observe scale (caller should fall back).
+    """
+    assert src_cam_poses.shape == tgt_cam_poses.shape
+
+    src_pos = src_cam_poses[:, :3, 3]
+    tgt_pos = tgt_cam_poses[:, :3, 3]
+
+    src_centroid = src_pos.mean(axis=0)
+    tgt_centroid = tgt_pos.mean(axis=0)
+    src_c = src_pos - src_centroid
+    tgt_c = tgt_pos - tgt_centroid
+
+    # Orientation axes (unit -> scale invariant) stabilise the rotation estimate.
+    src_x, src_y, src_z = src_cam_poses[:, :3, 0], src_cam_poses[:, :3, 1], src_cam_poses[:, :3, 2]
+    tgt_x, tgt_y, tgt_z = tgt_cam_poses[:, :3, 0], tgt_cam_poses[:, :3, 1], tgt_cam_poses[:, :3, 2]
+
+    src_aug = np.concatenate([src_c, src_x, src_y, src_z], axis=0)
+    tgt_aug = np.concatenate([tgt_c, tgt_x, tgt_y, tgt_z], axis=0)
+
+    H = src_aug.T @ tgt_aug
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    # Umeyama optimal scale from positions only: sum<tgt_c, R src_c> / sum||src_c||^2.
+    den = float((src_c ** 2).sum())
+    if den < min_spread:
+        return None, R, tgt_centroid - R @ src_centroid, src_centroid, tgt_centroid
+
+    num = float(np.sum(tgt_c * (src_c @ R.T)))
+    s = max(num / den, 1e-3)
+    t = tgt_centroid - s * (R @ src_centroid)
+
+    return s, R, t, src_centroid, tgt_centroid
