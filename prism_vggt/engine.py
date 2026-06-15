@@ -14,7 +14,8 @@ from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
 class StreamingWindowEngine:
-    def __init__(self, perception: BasePerceptionExtractor, voxel_size=0.02, max_depth=4.5, target_camera_height=1.5, device="cuda"):
+    def __init__(self, perception: BasePerceptionExtractor, voxel_size=0.02, max_depth=4.5, target_camera_height=1.5,
+                 face_size=512, crop_margin=24, device="cuda"):
         self.perception = perception
         self.device = device
 
@@ -22,11 +23,30 @@ class StreamingWindowEngine:
         self.voxel_size = voxel_size
         self.target_camera_height = target_camera_height
 
+        # --- Cubemap reprojection resolution -----------------------------------
+        # The equirectangular panorama can't be fed to nvblox's pinhole projective
+        # integrator directly, so tsdf.py reprojects the 360 sphere onto 6 virtual
+        # 90-deg-FOV pinhole faces. ``face_size`` is the pixel resolution of each
+        # cube face; ``crop_margin`` trims the distorted/overlapping seam pixels at
+        # each face edge.
+        #
+        # Sizing: the panorama's angular resolution is ~W/360 px/deg (e.g.
+        # 1036/360 ~= 2.9 px/deg). A face of size F over 90 deg gives F/90 px/deg at
+        # the face *center* (denser toward corners). Matching the pano at center
+        # wants F ~= 2.9*90 ~= 260; F=512 keeps a ~2x safety margin so thin
+        # structures near face edges survive. F=1024 is ~4x linear oversampling of a
+        # 1036-wide pano -> pure wasted grid_sample + VRAM, no extra real detail.
+        self.face_size = face_size
+        self.crop_margin = crop_margin
+
         # Colorizer memory budget. Coloring streams over ALL keyframes (no data is
         # dropped), but processes them in bounded camera batches x point chunks so
         # VRAM no longer scales with sequence length. Tune down if you still OOM.
         self.color_cam_batch = 8
         self.color_point_chunk = 500_000
+        # Coarse grid (multiples of voxel_size) used for the incremental color
+        # cache: one cached color per block, propagated to all dense vertices in it.
+        self.color_block_mult = 2.5
 
         # --- nvblox VRAM bounding ---------------------------------------------
         # The nvblox TSDF volume grows with explored area; on a streaming run it
@@ -74,9 +94,10 @@ class StreamingWindowEngine:
         self.last_flush_submap = 0
 
         self.tsdf = NvbloxPanoTSDF(
-            voxel_size_m=self.voxel_size, 
-            max_depth=self.max_depth, 
-            crop_margin=24, 
+            voxel_size_m=self.voxel_size,
+            max_depth=self.max_depth,
+            face_size=self.face_size,
+            crop_margin=self.crop_margin,
             device=self.device
         )
         
@@ -86,9 +107,18 @@ class StreamingWindowEngine:
         self.full_poses = []
         self.processed_indices = []
 
-        self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses = [], [], [], []
-        self.last_kf_pose = None
-        
+        # --- Persistent block color cache (incremental coloring) ---------------
+        # Coloring no longer re-projects the whole map against every keyframe each
+        # submap. Instead we keep a sparse cache of best-view colors keyed by a
+        # coarse "color block" grid (voxel_size * COLOR_BLOCK_MULT). Each submap we
+        # only (re)project the blocks near the CURRENT window's cameras against THAT
+        # window's frames; all other blocks reuse their cached color. This bounds
+        # per-submap coloring cost to the live region (flat over time) and keeps the
+        # currently-viewed area refreshed for dynamic obstacles.
+        self._cache_packed = np.empty((0,), dtype=np.int64)   # sorted block keys
+        self._cache_color = np.empty((0, 3), dtype=np.float64) # rgb in [0, 1]
+        self._cache_score = np.empty((0,), dtype=np.float64)   # best-view score
+
         self.submap_count = 0
         self.is_first_window = True
         self.current_metric_scale = 1.0
@@ -106,43 +136,44 @@ class StreamingWindowEngine:
             self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         torch.cuda.synchronize()
 
+    # --- Color block key packing -------------------------------------------
+    # Pack an integer (x, y, z) block index into a single int64 so blocks can be
+    # cached/looked-up with vectorised numpy set operations. Offset keeps negative
+    # indices non-negative; range is +/- 2^19 blocks (~26 km at 5 cm blocks).
+    _KEY_OFFSET = 1 << 19
+    _KEY_STRIDE = 1 << 20
+
+    def _block_size(self):
+        return self.voxel_size * self.color_block_mult
+
+    def _pack_keys(self, keys_xyz):
+        k = keys_xyz.astype(np.int64) + self._KEY_OFFSET
+        s = self._KEY_STRIDE
+        return (k[:, 0] * s + k[:, 1]) * s + k[:, 2]
+
     @torch.no_grad()
-    def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
-        """Best-view colorization of the geometry vertices over ALL keyframes.
-        
-        Uses "block coloring" (image projection downsampling): we voxel-downsample
-        the vertices *just* for the expensive PyTorch projection math, then use a 
-        KDTree to propagate those block colors back to the dense mesh vertices.
+    def _project_blocks(self, pts_np, nrm_np, rgbs, depths, masks, poses):
+        """Best-view color + score for a (small, bounded) set of block reps.
+
+        This is the original PyTorch projection math, but now run only over the
+        blocks near the current window and only against the current window's frames.
+        Returns (colors [M,3] in [0,1], scores [M,]) as numpy arrays.
         """
-        num_pts = vertices_np.shape[0]
-        num_cams = len(batch_rgbs)
-        if num_pts == 0 or num_cams == 0:
-            return np.zeros((num_pts, 3))
-
-        # --- Block Coloring Downsample ---
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(vertices_np)
-        pcd.normals = o3d.utility.Vector3dVector(normals_np)
-        
-        down_pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size * 2.5) # e.g. 5cm blocks
-        down_vertices_np = np.asarray(down_pcd.points)
-        down_normals_np = np.asarray(down_pcd.normals)
-        
-        num_down_pts = down_vertices_np.shape[0]
-        if num_down_pts == 0:
-            return np.zeros((num_pts, 3))
-
         device = self.device
+        M = pts_np.shape[0]
+        num_cams = len(rgbs)
+        if M == 0 or num_cams == 0:
+            return np.zeros((M, 3)), np.full((M,), -1.0)
 
-        vertices = torch.from_numpy(down_vertices_np).float().to(device)
-        normals = torch.from_numpy(down_normals_np).float().to(device)
-        final_colors = torch.zeros((num_down_pts, 3), device=device)
-        best_score = torch.full((num_down_pts,), -1.0, device=device)
+        vertices = torch.from_numpy(pts_np).float().to(device)
+        normals = torch.from_numpy(nrm_np).float().to(device)
+        final_colors = torch.zeros((M, 3), device=device)
+        best_score = torch.full((M,), -1.0, device=device)
 
-        rgbs_all = np.stack(batch_rgbs)
-        depths_all = np.stack(batch_depths)
-        masks_all = np.stack(batch_masks)
-        poses_all = np.stack(batch_poses)
+        rgbs_all = np.stack(rgbs)
+        depths_all = np.stack(depths)
+        masks_all = np.stack(masks)
+        poses_all = np.stack(poses)
 
         CAM_BATCH = max(1, int(self.color_cam_batch))
         CHUNK_SIZE = max(1, int(self.color_point_chunk))
@@ -159,8 +190,8 @@ class StreamingWindowEngine:
             R_w_c = poses_t[:, :3, :3]
             t_w_c = poses_t[:, :3, 3]
 
-            for start_idx in range(0, num_down_pts, CHUNK_SIZE):
-                end_idx = min(start_idx + CHUNK_SIZE, num_down_pts)
+            for start_idx in range(0, M, CHUNK_SIZE):
+                end_idx = min(start_idx + CHUNK_SIZE, M)
                 v_chunk = vertices[start_idx:end_idx]
                 n_chunk = normals[start_idx:end_idx]
                 C_size = v_chunk.shape[0]
@@ -191,27 +222,114 @@ class StreamingWindowEngine:
                     torch.tensor(-1.0, device=device)
                 )
 
-                # Best camera within THIS batch for each point.
                 batch_max, batch_best = torch.max(score, dim=0)
 
-                # Merge with the running best across previously processed batches.
                 update_mask = batch_max > best_score[start_idx:end_idx]
                 if update_mask.any():
                     arange = torch.arange(C_size, device=device)
-                    chosen_colors = sampled_colors[batch_best, :, arange]  # (C_size, 3)
+                    chosen_colors = sampled_colors[batch_best, :, arange]
                     final_colors[start_idx:end_idx][update_mask] = chosen_colors[update_mask]
                     best_score[start_idx:end_idx][update_mask] = batch_max[update_mask]
 
             del imgs_t, depths_t, masks_t, poses_t, R_w_c, t_w_c
 
-        down_colors_np = final_colors.cpu().numpy()
-        
-        # --- Propagate back to dense mesh ---
-        from scipy.spatial import cKDTree
-        tree = cKDTree(down_vertices_np)
-        _, indices = tree.query(vertices_np, k=1)
-        
-        return down_colors_np[indices]
+        return final_colors.cpu().numpy(), best_score.cpu().numpy()
+
+    def _cache_lookup(self, query_packed):
+        """Return (colors [Q,3], scores [Q], found [Q]) for the queried block keys."""
+        Q = query_packed.shape[0]
+        colors = np.zeros((Q, 3), dtype=np.float64)
+        scores = np.full((Q,), -1.0, dtype=np.float64)
+        found = np.zeros((Q,), dtype=bool)
+        if self._cache_packed.shape[0] == 0:
+            return colors, scores, found
+        pos = np.searchsorted(self._cache_packed, query_packed)
+        pos = np.clip(pos, 0, self._cache_packed.shape[0] - 1)
+        hit = self._cache_packed[pos] == query_packed
+        colors[hit] = self._cache_color[pos[hit]]
+        scores[hit] = self._cache_score[pos[hit]]
+        found[hit] = True
+        return colors, scores, found
+
+    def _cache_update(self, keys_packed, colors, scores):
+        """Merge improved block colors into the persistent cache (best-view wins)."""
+        if keys_packed.shape[0] == 0:
+            return
+        if self._cache_packed.shape[0] > 0:
+            pos = np.searchsorted(self._cache_packed, keys_packed)
+            pos = np.clip(pos, 0, self._cache_packed.shape[0] - 1)
+            exists = self._cache_packed[pos] == keys_packed
+            # Update existing blocks where the new view scores better.
+            ex_pos, ex_new = pos[exists], np.nonzero(exists)[0]
+            better = scores[ex_new] > self._cache_score[ex_pos]
+            upd = ex_pos[better]
+            self._cache_color[upd] = colors[ex_new][better]
+            self._cache_score[upd] = scores[ex_new][better]
+            new = ~exists
+        else:
+            new = np.ones((keys_packed.shape[0],), dtype=bool)
+        # Insert brand-new blocks, keeping the cache arrays sorted by key.
+        if new.any():
+            merged_packed = np.concatenate([self._cache_packed, keys_packed[new]])
+            merged_color = np.concatenate([self._cache_color, colors[new]])
+            merged_score = np.concatenate([self._cache_score, scores[new]])
+            order = np.argsort(merged_packed, kind="stable")
+            self._cache_packed = merged_packed[order]
+            self._cache_color = merged_color[order]
+            self._cache_score = merged_score[order]
+
+    def _clear_color_cache(self):
+        self._cache_packed = np.empty((0,), dtype=np.int64)
+        self._cache_color = np.empty((0, 3), dtype=np.float64)
+        self._cache_score = np.empty((0,), dtype=np.float64)
+
+    @torch.no_grad()
+    def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
+        """Incremental best-view colorization.
+
+        Quantize every mesh vertex to a coarse color-block grid (our own grid, so a
+        dense vertex and its block representative share the exact same key -> exact
+        O(N) propagation, no KDTree). Only blocks near the CURRENT window's cameras
+        are (re)projected, and only against THAT window's frames; all other blocks
+        read their color straight from the persistent cache. Per-submap cost is thus
+        bounded by the live region instead of growing with the whole map.
+        """
+        num_pts = vertices_np.shape[0]
+        if num_pts == 0:
+            return np.zeros((num_pts, 3))
+
+        bsize = self._block_size()
+        keys = np.floor(vertices_np / bsize).astype(np.int64)
+        packed = self._pack_keys(keys)
+        # np.unique returns (unique, index, inverse) in THAT order.
+        uniq_packed, first_idx, inv = np.unique(packed, return_index=True, return_inverse=True)
+        inv = inv.reshape(-1)
+        rep_xyz = vertices_np[first_idx]
+        rep_nrm = normals_np[first_idx]
+
+        # Start every block from its cached color (covers static, out-of-view areas).
+        colors, scores, _ = self._cache_lookup(uniq_packed)
+
+        num_cams = len(batch_rgbs)
+        if num_cams > 0:
+            cam_centers = np.stack([p[:3, 3] for p in batch_poses])
+            nearest = np.linalg.norm(
+                rep_xyz[:, None, :] - cam_centers[None, :, :], axis=2
+            ).min(axis=1)
+            active = nearest <= (self.max_depth + bsize)
+            if active.any():
+                a = np.nonzero(active)[0]
+                new_cols, new_sco = self._project_blocks(
+                    rep_xyz[a], rep_nrm[a], batch_rgbs, batch_depths, batch_masks, batch_poses
+                )
+                better = new_sco > scores[a]
+                ab = a[better]
+                colors[ab] = new_cols[better]
+                scores[ab] = new_sco[better]
+                # Persist improved live-region colors for future submaps.
+                self._cache_update(uniq_packed[ab], new_cols[better], new_sco[better])
+
+        return colors[inv]
 
     @staticmethod
     def _free_vram_gb():
@@ -220,22 +338,27 @@ class StreamingWindowEngine:
         free, _ = torch.cuda.mem_get_info()
         return free / (1024 ** 3)
 
-    def _color_geometry(self, geometry):
+    def _color_geometry(self, geometry, rgbs=None, depths=None, masks=None, poses=None):
         """Colorize an already-extracted volume mesh in place (vertices = point
-        cloud). Returns the colored mesh, or the input unchanged if empty."""
-        if geometry is None or len(geometry.vertices) == 0 or len(self.kf_rgbs) == 0:
+        cloud). Returns the colored mesh, or the input unchanged if empty.
+
+        ``rgbs/depths/masks/poses`` are the CURRENT window's frames; pass none to
+        color purely from the persistent cache (e.g. the final full-map extraction).
+        """
+        if geometry is None or len(geometry.vertices) == 0:
             return geometry
         geometry.compute_vertex_normals()
         colors = self._apply_pytorch_colors(
             np.asarray(geometry.vertices),
             np.asarray(geometry.vertex_normals),
-            self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses
+            rgbs or [], depths or [], masks or [], poses or []
         )
         geometry.vertex_colors = o3d.utility.Vector3dVector(colors)
         return geometry
 
     def _extract_and_color_current(self):
-        """Extract the current nvblox volume and colorize it (used at sequence end)."""
+        """Extract the current nvblox volume and colorize it from the cache (used at
+        sequence end, when there is no 'current window' left to project)."""
         return self._color_geometry(self.tsdf.extract_geometry())
 
     @staticmethod
@@ -253,7 +376,7 @@ class StreamingWindowEngine:
 
     def _flush_to_accumulator(self, colored_mesh):
         """Append a colored volume to the persistent CPU map, then free the GPU
-        volume and the per-window keyframe buffers so VRAM stays bounded."""
+        volume and the color cache so VRAM/host memory stay bounded."""
         if colored_mesh is not None and len(colored_mesh.vertices) > 0:
             self.accum_mesh += colored_mesh
 
@@ -262,9 +385,10 @@ class StreamingWindowEngine:
         if self.accum_downsample and self.voxel_size > 0 and len(self.accum_pcd_cache.points) > 0:
             self.accum_pcd_cache = self.accum_pcd_cache.voxel_down_sample(self.voxel_size)
 
-        # Release GPU TSDF blocks and per-window keyframes.
+        # Release GPU TSDF blocks. The flushed geometry is already colored into
+        # accum_mesh, and the GPU volume is cleared, so its color cache can go too.
         self.tsdf.mapper.clear()
-        self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses = [], [], [], []
+        self._clear_color_cache()
         self.last_flush_submap = self.submap_count + 1
         gc.collect()
         torch.cuda.empty_cache()
@@ -462,28 +586,6 @@ class StreamingWindowEngine:
                     batch_masks.append(window_masks[j])
                     batch_poses.append(tsdf_pose)
 
-                    add_new_kf = True
-                    if self.last_kf_pose is not None:
-                        dist = np.linalg.norm(tsdf_pose[:3, 3] - self.last_kf_pose[:3, 3])
-                        R_diff = tsdf_pose[:3, :3] @ self.last_kf_pose[:3, :3].T
-                        trace = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
-                        angle = np.arccos(trace) * 180.0 / np.pi
-                        if dist < 0.1 and angle < 10.0:
-                            add_new_kf = False
-                            
-                    if add_new_kf or len(self.kf_poses) == 0:
-                        self.kf_depths.append(depth_map)
-                        self.kf_rgbs.append(window_frames[j])
-                        self.kf_masks.append(window_masks[j])
-                        self.kf_poses.append(tsdf_pose)
-                        self.last_kf_pose = tsdf_pose.copy()
-                    else:
-                        self.kf_depths[-1] = depth_map
-                        self.kf_rgbs[-1] = window_frames[j]
-                        self.kf_masks[-1] = window_masks[j]
-                        self.kf_poses[-1] = tsdf_pose
-                        self.last_kf_pose = tsdf_pose.copy()
-
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
                         self.prev_overlap_global_poses = []
@@ -513,7 +615,11 @@ class StreamingWindowEngine:
             profiler["Geometry_Extraction"] = time.time() - t_extract
 
             t_color = time.time()
-            self.last_mesh = self._color_geometry(current_geometry)
+            # Color against THIS window's frames only; the persistent cache supplies
+            # colors for everything outside the live region (bounded per-submap cost).
+            self.last_mesh = self._color_geometry(
+                current_geometry, batch_rgbs, batch_depths, batch_masks, batch_poses
+            )
             profiler["Coloring"] = time.time() - t_color
 
             # --- Flush the GPU volume to the CPU accumulator if needed ----------
