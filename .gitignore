@@ -32,5 +32,5 @@ viser_results/
 video.mp4
 
 
-examples/*
+# examples/*
 !examples/PUT_IMAGE_FRAMES_HERE.MD
