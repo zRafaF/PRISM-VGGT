@@ -48,6 +48,10 @@ class StreamingWindowEngine:
         # cache: one cached color per block, propagated to all dense vertices in it.
         self.color_block_mult = 2.5
 
+        # Dump nvblox's internal C++ stage timers every N submaps (0 = off). These
+        # give the library's own per-stage breakdown (integration, meshing, ...).
+        self.nvblox_timing_every = 0
+
         # --- nvblox VRAM bounding ---------------------------------------------
         # The nvblox TSDF volume grows with explored area; on a streaming run it
         # eventually exhausts VRAM when its block hash doubles. To keep ALL the
@@ -347,7 +351,8 @@ class StreamingWindowEngine:
         """
         if geometry is None or len(geometry.vertices) == 0:
             return geometry
-        geometry.compute_vertex_normals()
+        if not geometry.has_vertex_normals():
+            geometry.compute_vertex_normals()
         colors = self._apply_pytorch_colors(
             np.asarray(geometry.vertices),
             np.asarray(geometry.vertex_normals),
@@ -610,9 +615,39 @@ class StreamingWindowEngine:
                 self.tsdf_future.result()
                 self.tsdf_future = None
 
-            t_extract = time.time()
-            current_geometry = self.tsdf.extract_geometry()
-            profiler["Geometry_Extraction"] = time.time() - t_extract
+            # --- Geometry extraction, split into its real sub-costs --------------
+            # 1) marching cubes (incremental in nvblox), 2) pulling the full mesh
+            # tensors GPU->CPU, 3) building the Open3D object. (2)+(3) copy the whole
+            # growing mesh every submap, so this is where we expect any growth.
+            t0 = time.time()
+            self.tsdf.update_mesh()
+            torch.cuda.synchronize()
+            profiler["Mesh_MarchingCubes"] = time.time() - t0
+
+            t0 = time.time()
+            cmesh = self.tsdf.get_color_mesh_raw()
+            v_t, c_t, tri_t = cmesh.vertices(), cmesh.vertex_colors(), cmesh.triangles()
+            torch.cuda.synchronize()
+            profiler["Mesh_GetHandles"] = time.time() - t0
+
+            t0 = time.time()
+            v_np = v_t.cpu().numpy()
+            c_np = (c_t.to(torch.float64) / 255.0).cpu().numpy()
+            tri_np = tri_t.cpu().numpy()
+            profiler["Mesh_GPU2CPU"] = time.time() - t0
+
+            t0 = time.time()
+            current_geometry = o3d.geometry.TriangleMesh()
+            current_geometry.vertices = o3d.utility.Vector3dVector(v_np)
+            current_geometry.vertex_colors = o3d.utility.Vector3dVector(c_np)
+            current_geometry.triangles = o3d.utility.Vector3iVector(tri_np)
+            profiler["Mesh_O3D_Build"] = time.time() - t0
+
+            # Per-vertex normals (o3d, CPU) run over the whole mesh -> can grow with
+            # map size, so profile it apart from the bounded projection cost.
+            t0 = time.time()
+            current_geometry.compute_vertex_normals()
+            profiler["Mesh_Normals"] = time.time() - t0
 
             t_color = time.time()
             # Color against THIS window's frames only; the persistent cache supplies
@@ -649,7 +684,13 @@ class StreamingWindowEngine:
             print("  --- ⏱️ Process Timing (Seconds) ---")
             for k, v in profiler.items():
                 print(f"    - {k:<20}: {v:.3f}s")
+            mesh_total = sum(v for k, v in profiler.items() if k.startswith("Mesh_"))
+            print(f"    - [Mesh subtotal]     : {mesh_total:.3f}s")
             print(f"    = Total Submap Time   : {(time.time() - t_win_start):.3f}s")
+
+            if self.nvblox_timing_every and (self.submap_count % self.nvblox_timing_every == 0):
+                print("  --- 🧱 nvblox internal timers ---")
+                self.tsdf.print_nvblox_timing()
 
             print("  --- 💾 GPU Memory (VRAM) ---")
             print(f"    - PyTorch Peak Alloc  : {pt_alloc:.2f} GB")

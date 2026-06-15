@@ -106,6 +106,16 @@ class NvbloxPanoTSDF:
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             self.mapper.add_depth_frame(optical_depth, face_pose.cpu(), self.camera)
 
+    def update_mesh(self):
+        """Run (incremental) marching cubes on the TSDF volume. nvblox only
+        re-meshes blocks touched since the last call, so this should stay roughly
+        constant per submap regardless of total map size."""
+        self.mapper.update_color_mesh()
+
+    def get_color_mesh_raw(self):
+        """Return the nvblox ColorMesh handle (GPU tensors, zero-copy views)."""
+        return self.mapper.get_color_mesh()
+
     def extract_geometry(self):
         """Extract the reconstructed geometry from the TSDF volume.
 
@@ -113,5 +123,12 @@ class NvbloxPanoTSDF:
         structure; the connectivity is only retained so we can derive per-vertex
         normals (used by the colorizer) and optionally export a .glb.
         """
-        self.mapper.update_color_mesh()
-        return self.mapper.get_color_mesh().to_open3d()
+        self.update_mesh()
+        return self.get_color_mesh_raw().to_open3d()
+
+    def print_nvblox_timing(self):
+        """Dump nvblox's internal C++ stage timers (integration, meshing, etc.)."""
+        try:
+            print(self.mapper.print_timing())
+        except Exception as e:  # pragma: no cover - depends on nvblox build
+            print(f"[TSDF] nvblox timing unavailable: {e}")
