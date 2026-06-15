@@ -40,6 +40,12 @@ class StreamingWindowEngine:
         self.map_flush_min_free_gb = 3.0    # ...or sooner if free VRAM drops below this
         self.accum_downsample = True        # voxel-downsample the accumulated cloud (dedup overlaps)
 
+        # --- Point Cloud Decimation ---
+        # To speed up TSDF extraction/coloring, decimate the dense VGGT depth maps 
+        # before integration to reduce the number of traced rays.
+        self.decimation_method = "statistical" # "statistical", "distance", "variance", or "none"
+        self.decimation_ratio = 0.50 # Base drop ratio (e.g. 0.50 = drop 50% of points)
+
         # Minimum |cos(normal . up)| required to trust a floor detection for the
         # one-time gravity leveling of the world frame.
         self.level_min_confidence = 0.4
@@ -414,6 +420,27 @@ class StreamingWindowEngine:
                     scaled_pts = pts_list[j] * self.current_metric_scale
                     depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
 
+                    # --- Point Cloud Density Decimation ---
+                    if self.decimation_method != "none" and self.decimation_ratio > 0.0:
+                        drop_mask = None
+                        if self.decimation_method == "statistical":
+                            drop_mask = np.random.rand(*depth_map.shape) < self.decimation_ratio
+                        elif self.decimation_method == "distance":
+                            # Drop probability increases with depth (max 1.0 at max_depth)
+                            norm_depth = np.clip(depth_map / self.max_depth, 0.0, 1.0)
+                            drop_mask = np.random.rand(*depth_map.shape) < (norm_depth * self.decimation_ratio * 2.0)
+                        elif self.decimation_method == "variance":
+                            import cv2
+                            # Drop edges / high variance areas where depth jumps
+                            blurred = cv2.GaussianBlur(depth_map, (5, 5), 0)
+                            variance = np.abs(depth_map - blurred)
+                            # Normalize variance map and drop highest variance points based on ratio
+                            var_thresh = np.percentile(variance[depth_map > 0], (1.0 - self.decimation_ratio) * 100.0)
+                            drop_mask = variance > var_thresh
+                            
+                        if drop_mask is not None:
+                            depth_map[drop_mask] = 0.0
+
                     batch_depths.append(depth_map)
                     batch_rgbs.append(window_frames[j])
                     batch_masks.append(window_masks[j])
@@ -466,17 +493,24 @@ class StreamingWindowEngine:
                 self.tsdf_future = None
 
             t_extract = time.time()
-            if self.submap_count % 3 == 0:
-                current_geometry = self.tsdf.extract_geometry()
-                profiler["Geometry_Extraction"] = time.time() - t_extract
+            current_geometry = self.tsdf.extract_geometry()
+            profiler["Geometry_Extraction"] = time.time() - t_extract
 
-                t_color = time.time()
-                self.last_mesh = self._color_geometry(current_geometry)
-                profiler["Coloring"] = time.time() - t_color
-            else:
-                current_geometry = self.last_mesh
-                profiler["Geometry_Extraction"] = 0.0
-                profiler["Coloring"] = 0.0
+            t_color = time.time()
+            
+            # --- Fast Decimation of the extracted mesh BEFORE coloring ---
+            # Voxel downsampling groups points into larger voxels and takes the average.
+            current_pcd = o3d.geometry.PointCloud()
+            current_pcd.points = current_geometry.vertices
+            current_pcd = current_pcd.voxel_down_sample(voxel_size=self.voxel_size * 2) 
+            
+            # We only care about vertices for the final output, so we can pass a mesh 
+            # with just vertices (no triangles) to the colorizer.
+            simplified_geometry = o3d.geometry.TriangleMesh()
+            simplified_geometry.vertices = current_pcd.points
+            
+            self.last_mesh = self._color_geometry(simplified_geometry)
+            profiler["Coloring"] = time.time() - t_color
 
             # --- Flush the GPU volume to the CPU accumulator if needed ----------
             # This is what actually bounds nvblox VRAM: once we've extracted and
