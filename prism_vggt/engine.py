@@ -655,9 +655,11 @@ class StreamingWindowEngine:
             # Wait for the background mapper, then pull the geometry. The point cloud
             # is just the vertices of this structure (connectivity is kept only for
             # normals / optional .glb export). Profiled on its own.
+            t_integ = time.time()
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
                 self.tsdf_future = None
+            profiler["TSDF_Integrate"] = time.time() - t_integ
 
             # --- Geometry extraction (gated by cadence) --------------------------
             # The costly part (pulling + rebuilding the full Open3D mesh) scales with
