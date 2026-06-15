@@ -35,7 +35,7 @@ class StreamingWindowEngine:
         # color the current volume, append it to a persistent CPU accumulator, then
         # clear the GPU volume (and the per-window keyframe buffers). The full map
         # therefore lives on the CPU; the GPU only ever holds one flush-window.
-        self.map_accumulate = True
+        self.map_accumulate = False
         self.map_flush_every_n = 3          # flush after this many submaps...
         self.map_flush_min_free_gb = 3.0    # ...or sooner if free VRAM drops below this
         self.accum_downsample = True        # voxel-downsample the accumulated cloud (dedup overlaps)
@@ -305,19 +305,16 @@ class StreamingWindowEngine:
             t2 = time.time()
             mid_idx = self.window_size // 2
 
-            # Pre-scale points before RANSAC Metrification
-            scale_pre = self.current_metric_scale
-            metric_pts_guess = pts_list[mid_idx] * scale_pre
-
-            floor_scale_correction, floor_conf, floor_plane = estimate_metric_scale_from_floor(
-                metric_pts_guess,
+            # Use raw unscaled points for RANSAC Metrification
+            floor_scale, floor_conf, floor_plane = estimate_metric_scale_from_floor(
+                pts_list[mid_idx],
                 target_camera_height=self.target_camera_height
             )
             
             # --- FIX 2: Restored Scale Dampening ---
             if self.is_first_window:
-                if floor_scale_correction is not None:
-                    self.current_metric_scale = self.current_metric_scale * floor_scale_correction
+                if floor_scale is not None:
+                    self.current_metric_scale = floor_scale
                 else:
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
@@ -334,8 +331,8 @@ class StreamingWindowEngine:
                 # 80% memory / 20% new IRLS reading
                 relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
                 
-                if floor_scale_correction is not None and floor_conf > 0.4:
-                    absolute_floor_scale = self.current_metric_scale * floor_scale_correction
+                if floor_scale is not None and floor_conf > 0.4:
+                    absolute_floor_scale = floor_scale
                     # 90% running scale / 10% floor correction
                     self.current_metric_scale = 0.9 * relative_scale + 0.1 * absolute_floor_scale
                 else:
@@ -382,8 +379,8 @@ class StreamingWindowEngine:
             # can render the exact plane that was found this submap.
             if floor_plane is not None and floor_conf >= self.level_min_confidence:
                 global_pose_mid = base @ anchor_pose @ canonical_poses[mid_idx]
-                centroid_metric = (floor_plane["centroid"] / max(scale_pre, 1e-6)) * self.current_metric_scale
-                extent_metric = (floor_plane["extent"] / max(scale_pre, 1e-6)) * self.current_metric_scale
+                centroid_metric = floor_plane["centroid"] * self.current_metric_scale
+                extent_metric = floor_plane["extent"] * self.current_metric_scale
                 normal_world = global_pose_mid[:3, :3] @ floor_plane["normal"]
                 centroid_world = (global_pose_mid @ np.append(centroid_metric, 1.0))[:3]
                 self.last_floor_plane = {
