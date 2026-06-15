@@ -59,6 +59,15 @@ class StreamingWindowEngine:
         # marching cubes catches up on the next extraction. 1 = every submap.
         self.mesh_extract_every = 1
 
+        # --- Point-cloud-only streaming ---------------------------------------
+        # The downstream client consumes the point cloud, not the triangle mesh, and
+        # building a full Open3D TriangleMesh every submap means ~6 Vector3dVector
+        # copies of the whole growing mesh. When True we skip the mesh entirely on
+        # the per-submap path: compute vertex normals on the GPU, color the vertices,
+        # and emit just the point cloud (2 copies). The triangle mesh / .glb is still
+        # built once at sequence end. Set False to restore the per-submap mesh.
+        self.point_cloud_only = True
+
         # --- nvblox VRAM bounding ---------------------------------------------
         # The nvblox TSDF volume grows with explored area; on a streaming run it
         # eventually exhausts VRAM when its block hash doubles. To keep ALL the
@@ -161,6 +170,14 @@ class StreamingWindowEngine:
         for j in range(len(poses)):
             self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         torch.cuda.synchronize()
+
+    def _timed_perception(self, window_frames):
+        """Run perception and stash its true wall-clock cost in the result, so the
+        (otherwise hidden, background) inference time is visible in the profiler."""
+        t = time.time()
+        preds = self.perception.process_sequence(window_frames)
+        preds["_infer_time"] = time.time() - t
+        return preds
 
     # --- Color block key packing -------------------------------------------
     # Pack an integer (x, y, z) block index into a single int64 so blocks can be
@@ -420,6 +437,36 @@ class StreamingWindowEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
+    @torch.no_grad()
+    def _vertex_normals_gpu(self, v_t, tri_t):
+        """Area-weighted per-vertex normals computed on the GPU from the raw nvblox
+        vertex/triangle tensors (replaces o3d ``compute_vertex_normals`` so we never
+        need to build a TriangleMesh just to get normals for the colorizer)."""
+        v = v_t.float()
+        tri = tri_t.long()
+        v0, v1, v2 = v[tri[:, 0]], v[tri[:, 1]], v[tri[:, 2]]
+        # Cross product magnitude encodes triangle area -> area-weighted accumulation.
+        face_n = torch.cross(v1 - v0, v2 - v0, dim=1)
+        n = torch.zeros_like(v)
+        n.index_add_(0, tri[:, 0], face_n)
+        n.index_add_(0, tri[:, 1], face_n)
+        n.index_add_(0, tri[:, 2], face_n)
+        return torch.nn.functional.normalize(n, dim=1, eps=1e-8)
+
+    def _pcd_from_arrays(self, v_np, colors_np):
+        """Build the displayed point cloud from numpy vertices + colorizer colors,
+        keeping only colored points and folding in the (downsampled) flush cache."""
+        valid = colors_np.sum(axis=1) > 0.0
+        pts, cols = [v_np[valid]], [colors_np[valid]]
+        if len(self.accum_pcd_cache.points) > 0:
+            pts.append(np.asarray(self.accum_pcd_cache.points))
+            cols.append(np.asarray(self.accum_pcd_cache.colors))
+        pcd = o3d.geometry.PointCloud()
+        if any(len(p) for p in pts):
+            pcd.points = o3d.utility.Vector3dVector(np.concatenate(pts, axis=0))
+            pcd.colors = o3d.utility.Vector3dVector(np.concatenate(cols, axis=0))
+        return pcd
+
     def _build_display(self, current_mesh):
         """Cheap per-submap display: cached (frozen) accumulator cloud + the current
         live window. The live mesh is just the current window; the full map is always
@@ -456,7 +503,7 @@ class StreamingWindowEngine:
         if self.pipeline_inference and starts:
             first = starts[0]
             self.perc_future = self.perc_executor.submit(
-                self.perception.process_sequence, frames[first : first + self.window_size]
+                self._timed_perception, frames[first : first + self.window_size]
             )
 
         for k, i in enumerate(starts):
@@ -487,11 +534,12 @@ class StreamingWindowEngine:
                 if k + 1 < len(starts):
                     nxt = starts[k + 1]
                     self.perc_future = self.perc_executor.submit(
-                        self.perception.process_sequence, frames[nxt : nxt + self.window_size]
+                        self._timed_perception, frames[nxt : nxt + self.window_size]
                     )
                 else:
                     self.perc_future = None
                 profiler["Perception_Wait"] = time.time() - t1
+                profiler["Perception_Infer(bg)"] = preds.pop("_infer_time", 0.0)
             else:
                 preds = self.perception.process_sequence(window_frames)
                 torch.cuda.synchronize()
@@ -668,59 +716,90 @@ class StreamingWindowEngine:
             # block dirtied since the last update on the next extraction.
             do_extract = (self.submap_count % max(1, int(self.mesh_extract_every)) == 0)
             if do_extract:
-                # 1) marching cubes (incremental), 2) GPU->CPU pull, 3) o3d build.
+                # Marching cubes is incremental in nvblox and shared by both paths.
                 t0 = time.time()
                 self.tsdf.update_mesh()
                 torch.cuda.synchronize()
                 profiler["Mesh_MarchingCubes"] = time.time() - t0
 
-                t0 = time.time()
-                cmesh = self.tsdf.get_color_mesh_raw()
-                v_t, c_t, tri_t = cmesh.vertices(), cmesh.vertex_colors(), cmesh.triangles()
-                torch.cuda.synchronize()
-                profiler["Mesh_GetHandles"] = time.time() - t0
+                if self.point_cloud_only:
+                    # Pull only vertices + triangles, derive normals on the GPU, color
+                    # the vertices, and emit just the point cloud (no TriangleMesh).
+                    t0 = time.time()
+                    cmesh = self.tsdf.get_color_mesh_raw()
+                    v_t, tri_t = cmesh.vertices(), cmesh.triangles()
+                    torch.cuda.synchronize()
+                    profiler["Mesh_GetHandles"] = time.time() - t0
 
-                t0 = time.time()
-                v_np = v_t.cpu().numpy()
-                c_np = (c_t.to(torch.float64) / 255.0).cpu().numpy()
-                tri_np = tri_t.cpu().numpy()
-                profiler["Mesh_GPU2CPU"] = time.time() - t0
+                    t0 = time.time()
+                    normals_t = self._vertex_normals_gpu(v_t, tri_t)
+                    torch.cuda.synchronize()
+                    profiler["Mesh_Normals"] = time.time() - t0
 
-                t0 = time.time()
-                current_geometry = o3d.geometry.TriangleMesh()
-                current_geometry.vertices = o3d.utility.Vector3dVector(v_np)
-                current_geometry.vertex_colors = o3d.utility.Vector3dVector(c_np)
-                current_geometry.triangles = o3d.utility.Vector3iVector(tri_np)
-                profiler["Mesh_O3D_Build"] = time.time() - t0
+                    t0 = time.time()
+                    v_np = v_t.cpu().numpy()
+                    n_np = normals_t.cpu().numpy()
+                    profiler["Mesh_GPU2CPU"] = time.time() - t0
 
-                # Per-vertex normals (o3d, CPU) over the whole mesh -> profile apart.
-                t0 = time.time()
-                current_geometry.compute_vertex_normals()
-                profiler["Mesh_Normals"] = time.time() - t0
+                    t_color = time.time()
+                    colors_np = self._apply_pytorch_colors(
+                        v_np, n_np, batch_rgbs, batch_depths, batch_masks, batch_poses
+                    )
+                    profiler["Coloring"] = time.time() - t_color
 
-                t_color = time.time()
-                # Color against THIS window's frames only; the persistent cache supplies
-                # colors outside the live region (bounded per-submap cost).
-                self.last_mesh = self._color_geometry(
-                    current_geometry, batch_rgbs, batch_depths, batch_masks, batch_poses
-                )
-                profiler["Coloring"] = time.time() - t_color
+                    t0 = time.time()
+                    display_pcd = self._pcd_from_arrays(v_np, colors_np)
+                    profiler["PCD_Build"] = time.time() - t0
 
-                # --- Flush the GPU volume to the CPU accumulator if needed ------
-                free_gb = self._free_vram_gb()
-                submaps_since_flush = (self.submap_count + 1) - self.last_flush_submap
-                need_flush = self.map_accumulate and (
-                    submaps_since_flush >= self.map_flush_every_n or free_gb < self.map_flush_min_free_gb
-                )
-                if need_flush:
-                    self._flush_to_accumulator(self.last_mesh)
-                    current_for_display = None
-                    print(f"  > [Map] Flushed volume to CPU accumulator (free VRAM was {free_gb:.2f} GB).")
+                    self.last_pcd = display_pcd
+                    self.last_mesh = None
+                    display_mesh = o3d.geometry.TriangleMesh()
                 else:
-                    current_for_display = self.last_mesh
+                    # Full mesh path (kept for .glb-per-submap / A-B testing).
+                    t0 = time.time()
+                    cmesh = self.tsdf.get_color_mesh_raw()
+                    v_t, c_t, tri_t = cmesh.vertices(), cmesh.vertex_colors(), cmesh.triangles()
+                    torch.cuda.synchronize()
+                    profiler["Mesh_GetHandles"] = time.time() - t0
 
-                display_mesh, display_pcd = self._build_display(current_for_display)
-                self.last_pcd = display_pcd
+                    t0 = time.time()
+                    v_np = v_t.cpu().numpy()
+                    c_np = (c_t.to(torch.float64) / 255.0).cpu().numpy()
+                    tri_np = tri_t.cpu().numpy()
+                    profiler["Mesh_GPU2CPU"] = time.time() - t0
+
+                    t0 = time.time()
+                    current_geometry = o3d.geometry.TriangleMesh()
+                    current_geometry.vertices = o3d.utility.Vector3dVector(v_np)
+                    current_geometry.vertex_colors = o3d.utility.Vector3dVector(c_np)
+                    current_geometry.triangles = o3d.utility.Vector3iVector(tri_np)
+                    profiler["Mesh_O3D_Build"] = time.time() - t0
+
+                    t0 = time.time()
+                    current_geometry.compute_vertex_normals()
+                    profiler["Mesh_Normals"] = time.time() - t0
+
+                    t_color = time.time()
+                    self.last_mesh = self._color_geometry(
+                        current_geometry, batch_rgbs, batch_depths, batch_masks, batch_poses
+                    )
+                    profiler["Coloring"] = time.time() - t_color
+
+                    # --- Flush the GPU volume to the CPU accumulator if needed --
+                    free_gb = self._free_vram_gb()
+                    submaps_since_flush = (self.submap_count + 1) - self.last_flush_submap
+                    need_flush = self.map_accumulate and (
+                        submaps_since_flush >= self.map_flush_every_n or free_gb < self.map_flush_min_free_gb
+                    )
+                    if need_flush:
+                        self._flush_to_accumulator(self.last_mesh)
+                        current_for_display = None
+                        print(f"  > [Map] Flushed volume to CPU accumulator (free VRAM was {free_gb:.2f} GB).")
+                    else:
+                        current_for_display = self.last_mesh
+
+                    display_mesh, display_pcd = self._build_display(current_for_display)
+                    self.last_pcd = display_pcd
             else:
                 # Cadence skip: reuse the last extracted/colored geometry. Depth is
                 # still integrated; the displayed map refreshes on the next extract.
