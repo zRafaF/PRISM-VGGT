@@ -81,11 +81,20 @@ class StreamingWindowEngine:
         # one-time gravity leveling of the world frame.
         self.level_min_confidence = 0.4
 
+        # --- Perception/mapping pipeline --------------------------------------
+        # When enabled, the NEXT window's GPU inference is launched on a background
+        # thread while THIS window's mapping (integrate -> mesh -> color) runs on the
+        # main thread, overlapping the two ~equal costs. No data is skipped: every
+        # window is still fully integrated and meshed (unlike mesh_extract_every).
+        self.pipeline_inference = True
+
         self.vram_tracker = VRAMProfiler()
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
         self.tsdf_future = None
+        self.perc_executor = ThreadPoolExecutor(max_workers=1)
+        self.perc_future = None
         self.tsdf = None
-        
+
         print("[Engine] Initializing PRISM-VGGT Engine...")
         self.reset()
         
@@ -93,6 +102,12 @@ class StreamingWindowEngine:
         if self.tsdf_future is not None:
             self.tsdf_future.result()
             self.tsdf_future = None
+        if self.perc_future is not None:
+            try:
+                self.perc_future.result()
+            except Exception:
+                pass
+            self.perc_future = None
 
         self.last_mesh = None
         self.last_pcd = None
@@ -434,30 +449,56 @@ class StreamingWindowEngine:
         num_frames = len(frames)
         t_seq_start = time.time()
         
-        for i in range(0, num_frames - self.window_size + 1, self.window_size - self.overlap):
+        starts = list(range(0, num_frames - self.window_size + 1, self.window_size - self.overlap))
+
+        # Prime the pipeline: launch the first window's inference in the background so
+        # it is ready (or nearly) by the time the loop body asks for it.
+        if self.pipeline_inference and starts:
+            first = starts[0]
+            self.perc_future = self.perc_executor.submit(
+                self.perception.process_sequence, frames[first : first + self.window_size]
+            )
+
+        for k, i in enumerate(starts):
             self.vram_tracker.start()
             t_win_start = time.time()
             profiler = {}
 
             window_frames = frames[i : i + self.window_size]
             window_masks = masks[i : i + self.window_size]
-            
+
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
-            
+
             t0 = time.time()
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
                 self.tsdf_future = None
             profiler["TSDF_Sync"] = time.time() - t0
-            
+
             t1 = time.time()
-            preds = self.perception.process_sequence(window_frames)
-            torch.cuda.synchronize()
-            # Release the perception activations and return reserved blocks to the
-            # driver so the nvblox C++ allocator has room to grow.
-            torch.cuda.empty_cache()
-            profiler["Perception_Inference"] = time.time() - t1
+            if self.pipeline_inference:
+                # Collect THIS window's inference (running in the background), then
+                # immediately launch the NEXT window's inference so it overlaps all of
+                # this submap's mapping work below. The reported time is the residual
+                # WAIT, so it shrinks to ~0 whenever mapping is the longer leg.
+                preds = self.perc_future.result()
+                torch.cuda.synchronize()
+                if k + 1 < len(starts):
+                    nxt = starts[k + 1]
+                    self.perc_future = self.perc_executor.submit(
+                        self.perception.process_sequence, frames[nxt : nxt + self.window_size]
+                    )
+                else:
+                    self.perc_future = None
+                profiler["Perception_Wait"] = time.time() - t1
+            else:
+                preds = self.perception.process_sequence(window_frames)
+                torch.cuda.synchronize()
+                # Release the perception activations and return reserved blocks to the
+                # driver so the nvblox C++ allocator has room to grow.
+                torch.cuda.empty_cache()
+                profiler["Perception_Inference"] = time.time() - t1
 
             pts_list, poses = preds["points"], preds["poses"]
             
@@ -631,22 +672,22 @@ class StreamingWindowEngine:
                 torch.cuda.synchronize()
                 profiler["Mesh_MarchingCubes"] = time.time() - t0
 
-                # Only vertices + triangles are needed: the colorizer below overwrites
-                # vertex colors, so we skip pulling/building nvblox's default colors.
                 t0 = time.time()
                 cmesh = self.tsdf.get_color_mesh_raw()
-                v_t, tri_t = cmesh.vertices(), cmesh.triangles()
+                v_t, c_t, tri_t = cmesh.vertices(), cmesh.vertex_colors(), cmesh.triangles()
                 torch.cuda.synchronize()
                 profiler["Mesh_GetHandles"] = time.time() - t0
 
                 t0 = time.time()
                 v_np = v_t.cpu().numpy()
+                c_np = (c_t.to(torch.float64) / 255.0).cpu().numpy()
                 tri_np = tri_t.cpu().numpy()
                 profiler["Mesh_GPU2CPU"] = time.time() - t0
 
                 t0 = time.time()
                 current_geometry = o3d.geometry.TriangleMesh()
                 current_geometry.vertices = o3d.utility.Vector3dVector(v_np)
+                current_geometry.vertex_colors = o3d.utility.Vector3dVector(c_np)
                 current_geometry.triangles = o3d.utility.Vector3iVector(tri_np)
                 profiler["Mesh_O3D_Build"] = time.time() - t0
 
