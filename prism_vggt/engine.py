@@ -81,6 +81,7 @@ class StreamingWindowEngine:
         self.processed_indices = []
 
         self.kf_rgbs, self.kf_depths, self.kf_masks, self.kf_poses = [], [], [], []
+        self.last_kf_pose = None
         
         self.submap_count = 0
         self.is_first_window = True
@@ -418,10 +419,27 @@ class StreamingWindowEngine:
                     batch_masks.append(window_masks[j])
                     batch_poses.append(tsdf_pose)
 
-                    self.kf_depths.append(depth_map)
-                    self.kf_rgbs.append(window_frames[j])
-                    self.kf_masks.append(window_masks[j])
-                    self.kf_poses.append(tsdf_pose)
+                    add_new_kf = True
+                    if self.last_kf_pose is not None:
+                        dist = np.linalg.norm(tsdf_pose[:3, 3] - self.last_kf_pose[:3, 3])
+                        R_diff = tsdf_pose[:3, :3] @ self.last_kf_pose[:3, :3].T
+                        trace = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+                        angle = np.arccos(trace) * 180.0 / np.pi
+                        if dist < 0.1 and angle < 10.0:
+                            add_new_kf = False
+                            
+                    if add_new_kf or len(self.kf_poses) == 0:
+                        self.kf_depths.append(depth_map)
+                        self.kf_rgbs.append(window_frames[j])
+                        self.kf_masks.append(window_masks[j])
+                        self.kf_poses.append(tsdf_pose)
+                        self.last_kf_pose = tsdf_pose.copy()
+                    else:
+                        self.kf_depths[-1] = depth_map
+                        self.kf_rgbs[-1] = window_frames[j]
+                        self.kf_masks[-1] = window_masks[j]
+                        self.kf_poses[-1] = tsdf_pose
+                        self.last_kf_pose = tsdf_pose.copy()
 
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
@@ -443,18 +461,22 @@ class StreamingWindowEngine:
             # Wait for the background mapper, then pull the geometry. The point cloud
             # is just the vertices of this structure (connectivity is kept only for
             # normals / optional .glb export). Profiled on its own.
-            t_extract = time.time()
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
                 self.tsdf_future = None
 
-            current_geometry = self.tsdf.extract_geometry()
-            profiler["Geometry_Extraction"] = time.time() - t_extract
+            t_extract = time.time()
+            if self.submap_count % 3 == 0:
+                current_geometry = self.tsdf.extract_geometry()
+                profiler["Geometry_Extraction"] = time.time() - t_extract
 
-            # Coloring runs EVERY submap (separate, heavy pass - profiled on its own).
-            t_color = time.time()
-            self.last_mesh = self._color_geometry(current_geometry)
-            profiler["Coloring"] = time.time() - t_color
+                t_color = time.time()
+                self.last_mesh = self._color_geometry(current_geometry)
+                profiler["Coloring"] = time.time() - t_color
+            else:
+                current_geometry = self.last_mesh
+                profiler["Geometry_Extraction"] = 0.0
+                profiler["Coloring"] = 0.0
 
             # --- Flush the GPU volume to the CPU accumulator if needed ----------
             # This is what actually bounds nvblox VRAM: once we've extracted and
