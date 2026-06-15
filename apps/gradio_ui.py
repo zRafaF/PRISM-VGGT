@@ -1,9 +1,14 @@
+import os
+# Use an expandable allocator so PyTorch returns freed blocks to the driver, leaving
+# room for nvblox's separate CUDA allocator to grow (helps avoid the OOM crash).
+# Must be set BEFORE torch is imported (prism_vggt pulls it in below).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import gradio as gr
 import numpy as np
 import open3d as o3d
 import plotly.graph_objects as go
 import tempfile
-import os
 from PIL import Image
 
 from prism_vggt.backends.panovggt import PanoVGGTBackend
@@ -55,7 +60,41 @@ def create_plotly_figure_from_pcd(pcd, max_points=150000):
     fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111")
     return fig
 
-def create_plotly_figure_with_trajectory(pcd, trajectory, lc_edges, max_points=150000):
+def add_ground_plane_trace(fig, plane, size_scale=1.5):
+    """Render the exact detected floor plane as a semi-transparent quad.
+
+    ``plane`` is the dict produced by the engine: world-frame ``normal``, ``centroid``
+    and ``extent``. Axis remap matches the point cloud: plot x=X, y=Z, z=-Y.
+    """
+    if not plane:
+        return
+    n = np.asarray(plane["normal"], dtype=float)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    c = np.asarray(plane["centroid"], dtype=float)
+    ext = float(plane["extent"]) * size_scale
+
+    # Build an orthonormal basis spanning the plane.
+    helper = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, helper)
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+
+    corners = np.array([
+        c - ext * u - ext * v,
+        c + ext * u - ext * v,
+        c + ext * u + ext * v,
+        c - ext * u + ext * v,
+    ])
+    X, Y, Z = corners[:, 0], corners[:, 2], -corners[:, 1]
+    fig.add_trace(go.Mesh3d(
+        x=X, y=Y, z=Z,
+        i=[0, 0], j=[1, 2], k=[2, 3],
+        color="limegreen", opacity=0.35, name="Ground Plane",
+        showlegend=True, hoverinfo="name"
+    ))
+
+
+def create_plotly_figure_with_trajectory(pcd, trajectory, plane=None, show_ground_plane=False, max_points=150000):
     points = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors) * 255
     if len(points) > max_points:
@@ -63,17 +102,20 @@ def create_plotly_figure_with_trajectory(pcd, trajectory, lc_edges, max_points=1
         points, colors = points[idx], colors[idx]
 
     colors_str = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in colors]
-    
+
     fig = go.Figure()
     fig.add_trace(go.Scatter3d(x=points[:, 0], y=points[:, 2], z=-points[:, 1], mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0), name='Geometry'))
-    
+
     if trajectory is not None and len(trajectory) > 0:
         fig.add_trace(go.Scatter3d(
             x=trajectory[:, 0], y=trajectory[:, 2], z=-trajectory[:, 1],
             mode='lines+markers', name='Camera Trajectory',
             line=dict(color='cyan', width=4), marker=dict(size=4, color='orange')
         ))
-        
+
+    if show_ground_plane:
+        add_ground_plane_trace(fig, plane)
+
     fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111", legend=dict(x=0.02, y=0.98, font=dict(color="white")))
     return fig
 
@@ -114,9 +156,9 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
 
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
-    zenith_limit, nadir_limit, target_width, target_height, 
-    window_size, overlap, max_depth, voxel_size, camera_height, keyframe_dist,
-    live_stream_toggle
+    zenith_limit, nadir_limit, target_width, target_height,
+    window_size, overlap, max_depth, voxel_size, camera_height,
+    live_stream_toggle, show_ground_plane
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2: raise gr.Error("Please provide at least 2 valid images.")
@@ -128,19 +170,18 @@ def process_sequence_ui(
         masks.append(get_spherical_valid_mask(img_np.shape[0], img_np.shape[1], zenith_deg=zenith_limit, nadir_deg=nadir_limit))
 
     backend_state["frames"] = frames
-    
+
     streaming_engine.max_depth = float(max_depth)
     streaming_engine.voxel_size = float(voxel_size)
     streaming_engine.target_camera_height = float(camera_height)
-    streaming_engine.min_translation_m = float(keyframe_dist)
 
-    last_mesh, last_pcd, last_traj, last_edges = None, None, None, None
+    last_mesh, last_pcd, last_traj, last_plane = None, None, None, None
     generator = streaming_engine.process_sequence(frames=frames, masks=masks, window_size=int(window_size), overlap=int(overlap))
-    
-    for mesh, global_pcd, trajectory, lc_edges in generator:
-        last_mesh, last_pcd, last_traj, last_edges = mesh, global_pcd, trajectory, lc_edges
+
+    for mesh, global_pcd, trajectory, plane in generator:
+        last_mesh, last_pcd, last_traj, last_plane = mesh, global_pcd, trajectory, plane
         if live_stream_toggle:
-            fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
+            fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, plane, show_ground_plane)
             pcd_path = save_pcd_to_ply(global_pcd, "live_map")
             if mesh is None or len(mesh.vertices) == 0:
                 yield fig, pcd_path, None, None
@@ -150,7 +191,7 @@ def process_sequence_ui(
                 yield fig, pcd_path, mesh_path, mesh_path
 
     if last_pcd is not None:
-        fig = create_plotly_figure_with_trajectory(last_pcd, last_traj, last_edges)
+        fig = create_plotly_figure_with_trajectory(last_pcd, last_traj, last_plane, show_ground_plane)
         pcd_path = save_pcd_to_ply(last_pcd, "live_map")
         if last_mesh is None or len(last_mesh.vertices) == 0:
             yield fig, pcd_path, None, None
@@ -166,6 +207,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
         with gr.Column(scale=1):
             gr.Markdown("### 🚀 Real-Time Execution")
             live_stream_checkbox = gr.Checkbox(value=False, label="Live UI Streaming (Slows down processing)")
+            show_ground_plane_checkbox = gr.Checkbox(value=False, label="Show Detected Ground Plane")
 
             gr.Markdown("### Processing Controls")
             with gr.Row():
@@ -187,9 +229,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             voxel_size_slider = gr.Slider(minimum=0.01, maximum=0.10, value=0.02, step=0.01, label="Voxel Resolution (m) [Lower = Denser]")
             max_depth_slider = gr.Slider(minimum=2.0, maximum=15.0, value=4.5, step=0.5, label="Max Depth Ray Cutoff (m)")
             camera_height_slider = gr.Slider(minimum=0.1, maximum=3.0, value=1.5, step=0.1, label="Target Camera Height (m)")
-            
-            # --- FIX: Reinstated Keyframe Distance Slider ---
-            keyframe_dist_slider = gr.Slider(minimum=0.05, maximum=1.0, value=0.10, step=0.05, label="Keyframe Stamp Distance (m)")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -239,9 +278,10 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
     run_seq_btn.click(
         fn=process_sequence_ui,
         inputs=[
-            input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, 
-            target_width, target_height, window_size_slider, overlap_slider, 
-            max_depth_slider, voxel_size_slider, camera_height_slider, keyframe_dist_slider, live_stream_checkbox
+            input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider,
+            target_width, target_height, window_size_slider, overlap_slider,
+            max_depth_slider, voxel_size_slider, camera_height_slider,
+            live_stream_checkbox, show_ground_plane_checkbox
         ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh]
     )

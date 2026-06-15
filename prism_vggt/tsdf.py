@@ -106,6 +106,12 @@ class NvbloxPanoTSDF:
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             self.mapper.add_depth_frame(optical_depth, face_pose.cpu(), self.camera)
 
-    def extract_mesh(self):
+    def extract_geometry(self):
+        """Extract the reconstructed geometry from the TSDF volume.
+
+        The point cloud we ultimately care about is simply the vertices of this
+        structure; the connectivity is only retained so we can derive per-vertex
+        normals (used by the colorizer) and optionally export a .glb.
+        """
         self.mapper.update_color_mesh()
         return self.mapper.get_color_mesh().to_open3d()

@@ -15,6 +15,42 @@ def unproject_equirectangular_to_points(depth_map: np.ndarray) -> np.ndarray:
     
     return np.stack([X, Y, Z], axis=-1)
 
+def rotation_aligning_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Returns a 3x3 rotation matrix R such that R @ a is parallel to b.
+
+    Uses the Rodrigues formula for the rotation about the axis (a x b). Handles the
+    degenerate parallel / anti-parallel cases. Inputs need not be normalized.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+
+    v = np.cross(a, b)
+    s = np.linalg.norm(v)
+    c = float(np.dot(a, b))
+
+    if s < 1e-8:
+        # Already aligned, or exactly opposite.
+        if c > 0:
+            return np.eye(3)
+        # 180 degrees: rotate about any axis orthogonal to a.
+        ortho = np.array([1.0, 0.0, 0.0])
+        if abs(a[0]) > 0.9:
+            ortho = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(a, ortho)
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        K = np.array([[0, -axis[2], axis[1]],
+                      [axis[2], 0, -axis[0]],
+                      [-axis[1], axis[0], 0]])
+        return np.eye(3) + 2.0 * (K @ K)
+
+    K = np.array([[0, -v[2], v[1]],
+                  [v[2], 0, -v[0]],
+                  [-v[1], v[0], 0]])
+    return np.eye(3) + K + K @ K * ((1.0 - c) / (s ** 2))
+
+
 def homogenize_points(points):
     return torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
 
