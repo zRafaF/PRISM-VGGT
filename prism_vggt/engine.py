@@ -43,7 +43,7 @@ class StreamingWindowEngine:
         # --- Point Cloud Decimation ---
         # To speed up TSDF extraction/coloring, decimate the dense VGGT depth maps 
         # before integration to reduce the number of traced rays.
-        self.decimation_method = "statistical" # "statistical", "distance", "variance", or "none"
+        self.decimation_method = "none" # "statistical", "distance", "variance", or "none"
         self.decimation_ratio = 0.50 # Base drop ratio (e.g. 0.50 = drop 50% of points)
 
         # Minimum |cos(normal . up)| required to trust a floor detection for the
@@ -109,26 +109,35 @@ class StreamingWindowEngine:
     @torch.no_grad()
     def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
         """Best-view colorization of the geometry vertices over ALL keyframes.
-
-        For every vertex we keep the color from the keyframe that observes it with
-        the highest quality score (frontal, close, well-sampled, unoccluded). To keep
-        VRAM bounded regardless of how many keyframes accumulate, we stream over the
-        cameras in batches and over the points in chunks, maintaining a running
-        best-score per vertex. The result is bit-for-bit equivalent to scoring every
-        camera at once - we just never materialize the full (num_cams x num_pts)
-        tensor that previously caused the out-of-memory crash.
+        
+        Uses "block coloring" (image projection downsampling): we voxel-downsample
+        the vertices *just* for the expensive PyTorch projection math, then use a 
+        KDTree to propagate those block colors back to the dense mesh vertices.
         """
         num_pts = vertices_np.shape[0]
         num_cams = len(batch_rgbs)
         if num_pts == 0 or num_cams == 0:
             return np.zeros((num_pts, 3))
 
+        # --- Block Coloring Downsample ---
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices_np)
+        pcd.normals = o3d.utility.Vector3dVector(normals_np)
+        
+        down_pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size * 2.5) # e.g. 5cm blocks
+        down_vertices_np = np.asarray(down_pcd.points)
+        down_normals_np = np.asarray(down_pcd.normals)
+        
+        num_down_pts = down_vertices_np.shape[0]
+        if num_down_pts == 0:
+            return np.zeros((num_pts, 3))
+
         device = self.device
 
-        vertices = torch.from_numpy(vertices_np).float().to(device)
-        normals = torch.from_numpy(normals_np).float().to(device)
-        final_colors = torch.zeros((num_pts, 3), device=device)
-        best_score = torch.full((num_pts,), -1.0, device=device)
+        vertices = torch.from_numpy(down_vertices_np).float().to(device)
+        normals = torch.from_numpy(down_normals_np).float().to(device)
+        final_colors = torch.zeros((num_down_pts, 3), device=device)
+        best_score = torch.full((num_down_pts,), -1.0, device=device)
 
         rgbs_all = np.stack(batch_rgbs)
         depths_all = np.stack(batch_depths)
@@ -150,8 +159,8 @@ class StreamingWindowEngine:
             R_w_c = poses_t[:, :3, :3]
             t_w_c = poses_t[:, :3, 3]
 
-            for start_idx in range(0, num_pts, CHUNK_SIZE):
-                end_idx = min(start_idx + CHUNK_SIZE, num_pts)
+            for start_idx in range(0, num_down_pts, CHUNK_SIZE):
+                end_idx = min(start_idx + CHUNK_SIZE, num_down_pts)
                 v_chunk = vertices[start_idx:end_idx]
                 n_chunk = normals[start_idx:end_idx]
                 C_size = v_chunk.shape[0]
@@ -195,7 +204,14 @@ class StreamingWindowEngine:
 
             del imgs_t, depths_t, masks_t, poses_t, R_w_c, t_w_c
 
-        return final_colors.cpu().numpy()
+        down_colors_np = final_colors.cpu().numpy()
+        
+        # --- Propagate back to dense mesh ---
+        from scipy.spatial import cKDTree
+        tree = cKDTree(down_vertices_np)
+        _, indices = tree.query(vertices_np, k=1)
+        
+        return down_colors_np[indices]
 
     @staticmethod
     def _free_vram_gb():
@@ -497,19 +513,7 @@ class StreamingWindowEngine:
             profiler["Geometry_Extraction"] = time.time() - t_extract
 
             t_color = time.time()
-            
-            # --- Fast Decimation of the extracted mesh BEFORE coloring ---
-            # Voxel downsampling groups points into larger voxels and takes the average.
-            current_pcd = o3d.geometry.PointCloud()
-            current_pcd.points = current_geometry.vertices
-            current_pcd = current_pcd.voxel_down_sample(voxel_size=self.voxel_size * 2) 
-            
-            # We only care about vertices for the final output, so we can pass a mesh 
-            # with just vertices (no triangles) to the colorizer.
-            simplified_geometry = o3d.geometry.TriangleMesh()
-            simplified_geometry.vertices = current_pcd.points
-            
-            self.last_mesh = self._color_geometry(simplified_geometry)
+            self.last_mesh = self._color_geometry(current_geometry)
             profiler["Coloring"] = time.time() - t_color
 
             # --- Flush the GPU volume to the CPU accumulator if needed ----------
