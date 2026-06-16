@@ -35,12 +35,16 @@ If you prefer to install manually:
 * To install benchmarking tools, run `uv sync --extra benchmarks`.
 
 
-3. Download the weights:
+3. Download the weights. The library never downloads anything on its own; fetch the
+   checkpoint explicitly with the bundled helper:
 
 ```bash
-mkdir -p checkpoints
-wget -qnc [https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt](https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt) -O checkpoints/model.pt
+uv run python -c "from prism_vggt import download_weights; download_weights('checkpoints/model.pt')"
 ```
+
+   (Or manually: `wget -qnc https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoints/model.pt`.)
+   If the checkpoint is missing when you construct `PanoVGGTBackend`, it raises a clear
+   error telling you to run the line above.
 
 ### Handling Custom Environments (Different OS / CUDA versions)
 
@@ -68,22 +72,57 @@ uv run apps/gradio_ui.py
 
 ### Using PRISM-VGGT as a Python Library
 
+The public API is two objects: a perception backend (any `BasePerceptionExtractor`)
+and the `StreamingWindowEngine` that fuses it into a dense map.
+
 ```python
-from prism_vggt.backends.panovggt import PanoVGGTBackend
-from prism_vggt.engine import StreamingWindowEngine
+from prism_vggt import PanoVGGTBackend, StreamingWindowEngine, download_weights
 
-# 1. Initialize perception
+download_weights("checkpoints/model.pt")            # explicit, one-time
 perception = PanoVGGTBackend(weights_path="checkpoints/model.pt")
-
-# 2. Initialize the TSDF engine
 engine = StreamingWindowEngine(perception, voxel_size=0.02, max_depth=4.5)
 
-# 3. Process a sequence of images in overlapping batches
-for mesh, pointcloud, trajectory, edges in engine.process_sequence(
-    frames=my_rgb_list, 
-    masks=my_mask_list,
-    window_size=16, 
-    overlap=4
+for mesh, pointcloud, trajectory, floor in engine.process_sequence(
+    frames=my_rgb_list, masks=my_mask_list, window_size=16, overlap=4
 ):
-    print(f"Submap processed. Current map contains {len(mesh.vertices)} vertices.")
+    # `pointcloud` is the dense local-viz cloud for this submap.
+    print(f"Submap {engine.submap_count}: map version {engine.get_map_version()}")
 ```
+
+#### Streaming the point cloud to a client (deltas + snapshot)
+
+The map is exposed as **one colored point per ~5&nbsp;cm block**, with a monotonic
+version and per-block content hashes, so a client can stream only what changed and
+resync robustly after a dropped/garbled update:
+
+```python
+# Fast path: only blocks that changed since the client's last version.
+delta = engine.get_point_cloud_delta(since_version=client_version)
+#   -> {"points", "colors", "keys", "block_hashes", "version", "from_version"}
+
+# Resync path: full cloud + a whole-map hash to detect drift.
+snap = engine.get_point_cloud_snapshot()
+#   -> {"points", "colors", "keys", "block_hashes", "version", "map_hash"}
+```
+
+The library does **not** do the networking; it gives you stable block ids (`keys`),
+per-block hashes, and a map version so your transport layer can do delta or partial/full
+refetch. (Block *removal*, e.g. via TSDF decay, is not tracked yet.)
+
+#### Collision distances (ESDF)
+
+```python
+engine.compute_esdf = True                  # recompute the ESDF each submap (off by default)
+# ... after running process_sequence ...
+sl = engine.get_esdf_slice(y_world=0.0)     # horizontal slice of signed distances
+# sl -> {"xs", "zs", "distance" (Hz x Wx, meters), "y"}
+```
+
+#### Performance / parallelism
+
+Perception inference (GPU) and mapping (TSDF + mesh + color) run concurrently as a
+one-deep **A/B double buffer**: while window *k* is being mapped, window *k+1* is
+already being inferred. Windows are consumed strictly in order and none is skipped.
+Set `engine.pipeline_inference = False` to run them sequentially. Other knobs:
+`engine.point_cloud_only` (skip the per-submap triangle mesh), `engine.mesh_extract_every`
+(amortize mesh rebuilds), and `engine.face_size` (cubemap resolution).

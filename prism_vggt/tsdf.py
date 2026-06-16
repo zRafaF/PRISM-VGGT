@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import open3d as o3d
 
-from nvblox_torch.mapper import Mapper
+from nvblox_torch.mapper import Mapper, QueryType
 from nvblox_torch.sensor import Sensor
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 
@@ -125,6 +125,24 @@ class NvbloxPanoTSDF:
         """
         self.update_mesh()
         return self.get_color_mesh_raw().to_open3d()
+
+    def update_esdf(self):
+        """Recompute the Euclidean Signed Distance Field from the current TSDF.
+        Only needed if you query the ESDF (collision distances) for planning."""
+        self.mapper.update_esdf()
+
+    @torch.no_grad()
+    def query_esdf(self, points_xyz):
+        """Query ESDF distance (meters) at Nx3 world points.
+
+        Args:
+            points_xyz: (N, 3) float32 CUDA tensor of world coordinates.
+        Returns:
+            (N,) tensor of signed distances (negative = inside obstacles;
+            unobserved space returns nvblox's large 'unknown' sentinel distance).
+        """
+        out = self.mapper.query_layer(QueryType.ESDF, points_xyz)
+        return out.reshape(-1)
 
     def print_nvblox_timing(self):
         """Dump nvblox's internal C++ stage timers (integration, meshing, etc.)."""

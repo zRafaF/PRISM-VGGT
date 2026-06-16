@@ -27,7 +27,11 @@ class PanoVGGTBackend(BasePerceptionExtractor):
         
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Could not find config at {config_path}")
-            
+
+        if not os.path.exists(weights_path):
+            from prism_vggt.weights import missing_weights_message
+            raise FileNotFoundError(missing_weights_message(weights_path))
+
         cfg = OmegaConf.load(config_path)
         OmegaConf.resolve(cfg)
         mc = cfg.model

@@ -1,15 +1,15 @@
 import gc
+import time
+import hashlib
 import torch
 import numpy as np
 import open3d as o3d
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .tsdf import NvbloxPanoTSDF
 from .perception_base import BasePerceptionExtractor
 
-from .utils.alignment import align_cam_pts_irls
-from .utils.geometry import register_camera_poses_kabsch, register_camera_poses_sim3, rotation_aligning_vectors
+from .utils.geometry import register_camera_poses_sim3, rotation_aligning_vectors
 from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
@@ -68,6 +68,13 @@ class StreamingWindowEngine:
         # built once at sequence end. Set False to restore the per-submap mesh.
         self.point_cloud_only = True
 
+        # --- ESDF (Euclidean Signed Distance Field) ---------------------------
+        # Off by default. When True, the ESDF is recomputed each submap so callers
+        # can query collision distances (get_esdf_slice / tsdf.query_esdf) for
+        # planning. Adds a per-submap cost, so enable only if you need it.
+        self.compute_esdf = False
+        self.esdf_slice_resolution = 0.05  # meters between ESDF query samples
+
         # --- nvblox VRAM bounding ---------------------------------------------
         # The nvblox TSDF volume grows with explored area; on a streaming run it
         # eventually exhausts VRAM when its block hash doubles. To keep ALL the
@@ -79,12 +86,6 @@ class StreamingWindowEngine:
         self.map_flush_every_n = 3          # flush after this many submaps...
         self.map_flush_min_free_gb = 3.0    # ...or sooner if free VRAM drops below this
         self.accum_downsample = True        # voxel-downsample the accumulated cloud (dedup overlaps)
-
-        # --- Point Cloud Decimation ---
-        # To speed up TSDF extraction/coloring, decimate the dense VGGT depth maps 
-        # before integration to reduce the number of traced rays.
-        self.decimation_method = "none" # "statistical", "distance", "variance", or "none"
-        self.decimation_ratio = 0.50 # Base drop ratio (e.g. 0.50 = drop 50% of points)
 
         # Minimum |cos(normal . up)| required to trust a floor detection for the
         # one-time gravity leveling of the world frame.
@@ -153,6 +154,12 @@ class StreamingWindowEngine:
         self._cache_packed = np.empty((0,), dtype=np.int64)   # sorted block keys
         self._cache_color = np.empty((0, 3), dtype=np.float64) # rgb in [0, 1]
         self._cache_score = np.empty((0,), dtype=np.float64)   # best-view score
+        self._cache_version = np.empty((0,), dtype=np.int64)   # map_version a block last changed at
+
+        # Monotonic map version for delta streaming: bumped once per submap that
+        # touches the map; each block records the version it was last modified at,
+        # so a client can request "everything changed since version N".
+        self.map_version = 0
 
         self.submap_count = 0
         self.is_first_window = True
@@ -295,7 +302,12 @@ class StreamingWindowEngine:
         return colors, scores, found
 
     def _cache_update(self, keys_packed, colors, scores):
-        """Merge improved block colors into the persistent cache (best-view wins)."""
+        """Merge improved block colors into the persistent cache (best-view wins).
+
+        Every block that actually changes (a better-scoring view, or a brand-new
+        block) is stamped with the current ``map_version`` so delta streaming can
+        report exactly what moved since any prior version.
+        """
         if keys_packed.shape[0] == 0:
             return
         if self._cache_packed.shape[0] > 0:
@@ -308,23 +320,136 @@ class StreamingWindowEngine:
             upd = ex_pos[better]
             self._cache_color[upd] = colors[ex_new][better]
             self._cache_score[upd] = scores[ex_new][better]
+            self._cache_version[upd] = self.map_version
             new = ~exists
         else:
             new = np.ones((keys_packed.shape[0],), dtype=bool)
         # Insert brand-new blocks, keeping the cache arrays sorted by key.
         if new.any():
+            n_new = int(new.sum())
             merged_packed = np.concatenate([self._cache_packed, keys_packed[new]])
             merged_color = np.concatenate([self._cache_color, colors[new]])
             merged_score = np.concatenate([self._cache_score, scores[new]])
+            merged_version = np.concatenate([
+                self._cache_version, np.full((n_new,), self.map_version, dtype=np.int64)
+            ])
             order = np.argsort(merged_packed, kind="stable")
             self._cache_packed = merged_packed[order]
             self._cache_color = merged_color[order]
             self._cache_score = merged_score[order]
+            self._cache_version = merged_version[order]
 
     def _clear_color_cache(self):
         self._cache_packed = np.empty((0,), dtype=np.int64)
         self._cache_color = np.empty((0, 3), dtype=np.float64)
         self._cache_score = np.empty((0,), dtype=np.float64)
+        self._cache_version = np.empty((0,), dtype=np.int64)
+
+    # ------------------------------------------------------------------ #
+    #  Point-cloud streaming API (block-granular, version + hash based).  #
+    #  The streamable cloud is one point per color block (voxel_size *    #
+    #  color_block_mult); this is the bounded, delta-able representation  #
+    #  intended for a remote client. (The dense per-submap display cloud  #
+    #  from process_sequence is a separate, local-viz product.)           #
+    # ------------------------------------------------------------------ #
+    def _unpack_keys(self, packed):
+        """Inverse of _pack_keys: packed int64 -> (K, 3) int block indices."""
+        s, off = self._KEY_STRIDE, self._KEY_OFFSET
+        kz = (packed % s) - off
+        rem = packed // s
+        ky = (rem % s) - off
+        kx = (rem // s) - off
+        return np.stack([kx, ky, kz], axis=1)
+
+    def _block_centers(self, packed):
+        if packed.size == 0:
+            return np.zeros((0, 3), dtype=np.float64)
+        return (self._unpack_keys(packed).astype(np.float64) + 0.5) * self._block_size()
+
+    @staticmethod
+    def _block_hashes(packed, colors):
+        """Per-block content hash (uint64) over the block id + quantized color."""
+        if packed.size == 0:
+            return np.zeros((0,), dtype=np.uint64)
+        col8 = np.clip(np.round(colors * 255.0), 0, 255).astype(np.uint64)
+        col_packed = (col8[:, 0] << np.uint64(16)) | (col8[:, 1] << np.uint64(8)) | col8[:, 2]
+        k = packed.astype(np.uint64)
+        return (k * np.uint64(1099511628211)) ^ (col_packed * np.uint64(2654435761))
+
+    def get_map_version(self):
+        """Current monotonic map version (bumped once per extracted submap)."""
+        return int(self.map_version)
+
+    def _pack_cloud(self, packed, colors, since_version=None):
+        pts = self._block_centers(packed).astype(np.float32)
+        bh = self._block_hashes(packed, colors)
+        map_hash = 0
+        if packed.size:
+            map_hash = int(hashlib.blake2b(
+                np.ascontiguousarray(packed).tobytes() + np.ascontiguousarray(bh).tobytes(),
+                digest_size=8).hexdigest(), 16)
+        out = {
+            "points": pts,                              # (K,3) float32 world coords
+            "colors": np.ascontiguousarray(colors, dtype=np.float32),  # (K,3) rgb [0,1]
+            "keys": packed.copy(),                      # (K,) int64 stable block ids
+            "block_hashes": bh,                         # (K,) uint64 per-block hash
+            "version": int(self.map_version),
+            "map_hash": map_hash,                       # whole-cloud hash (drift check)
+        }
+        if since_version is not None:
+            out["from_version"] = int(since_version)
+        return out
+
+    def get_point_cloud_snapshot(self):
+        """Full streamable point cloud (one point per color block) + a map_hash the
+        client can compare against to detect drift and trigger a full resync."""
+        return self._pack_cloud(self._cache_packed, self._cache_color)
+
+    def get_point_cloud_delta(self, since_version):
+        """Only the blocks changed since ``since_version`` (the delta fast-path).
+
+        Same fields as the snapshot. On a detected drop/mismatch the client should
+        either re-request specific ``keys`` or fall back to get_point_cloud_snapshot().
+        Note: block removal (e.g. via TSDF decay) is not yet tracked here.
+        """
+        if self._cache_packed.size == 0:
+            return self._pack_cloud(self._cache_packed, self._cache_color, since_version)
+        changed = self._cache_version > int(since_version)
+        return self._pack_cloud(self._cache_packed[changed], self._cache_color[changed], since_version)
+
+    @torch.no_grad()
+    def get_esdf_slice(self, y_world=None, bounds=None, resolution=None, margin=1.0):
+        """Sample the ESDF on a horizontal (constant world-Y) grid, for viz/planning.
+
+        Args:
+            y_world: world Y of the slice plane. Defaults to the trajectory mean Y.
+            bounds: (x_min, x_max, z_min, z_max). Defaults to trajectory extent + margin.
+            resolution: meters between samples (defaults to esdf_slice_resolution).
+        Returns:
+            dict {xs (Wx,), zs (Hz,), distance (Hz, Wx), y} of ESDF distances in
+            meters, or None if ESDF isn't being computed or the map is empty.
+        """
+        if not self.compute_esdf or len(self.trajectory) == 0:
+            return None
+        traj = np.asarray(self.trajectory)
+        if bounds is None:
+            x_min, x_max = traj[:, 0].min() - margin, traj[:, 0].max() + margin
+            z_min, z_max = traj[:, 2].min() - margin, traj[:, 2].max() + margin
+        else:
+            x_min, x_max, z_min, z_max = bounds
+        if y_world is None:
+            y_world = float(traj[:, 1].mean())
+        res = float(resolution or self.esdf_slice_resolution)
+        xs = np.arange(x_min, x_max, res, dtype=np.float32)
+        zs = np.arange(z_min, z_max, res, dtype=np.float32)
+        if xs.size == 0 or zs.size == 0:
+            return None
+        gx, gz = np.meshgrid(xs, zs)               # (Hz, Wx)
+        gy = np.full_like(gx, y_world)
+        pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3).astype(np.float32)
+        q = torch.from_numpy(pts).to(self.device)
+        dist = self.tsdf.query_esdf(q).cpu().numpy().reshape(gx.shape)
+        return {"xs": xs, "zs": zs, "distance": dist, "y": float(y_world)}
 
     @torch.no_grad()
     def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
@@ -489,10 +614,33 @@ class StreamingWindowEngine:
         return display_mesh, display_pcd
 
     def process_sequence(self, frames, masks, window_size=16, overlap=4):
+        """Stream a sequence in overlapping windows, yielding one update per submap.
+
+        Yields ``(display_mesh, display_pcd, trajectory, floor_plane)`` per submap,
+        then a final full-map tuple. For streaming the point cloud to a client, use
+        the version/hash accessors (get_point_cloud_snapshot / get_point_cloud_delta)
+        rather than the dense display cloud.
+
+        Parallelism (A/B double buffer)
+        -------------------------------
+        Two stages run concurrently, coupled so no window is ever skipped or
+        processed out of order:
+
+          * Stage A (producer): GPU perception inference, on ``perc_executor``.
+          * Stage B (consumer): mapping (pose math -> TSDF integrate -> mesh ->
+            color -> point cloud), on the main thread.
+
+        The "buffer" is exactly one in-flight window: while Stage B consumes window
+        ``k``, Stage A is already producing window ``k+1`` (``perc_future``). The
+        loop blocks on ``perc_future.result()`` for window ``k`` *before* launching
+        ``k+1``, and consumes windows strictly in ``starts`` order, so the producer
+        can be at most one window ahead and never overruns or drops a window. Set
+        ``pipeline_inference=False`` to run the two stages sequentially instead.
+        """
         self.window_size = window_size
         self.overlap = overlap
         self.reset()
-        
+
         num_frames = len(frames)
         t_seq_start = time.time()
         
@@ -657,27 +805,6 @@ class StreamingWindowEngine:
                     scaled_pts = pts_list[j] * self.current_metric_scale
                     depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
 
-                    # --- Point Cloud Density Decimation ---
-                    if self.decimation_method != "none" and self.decimation_ratio > 0.0:
-                        drop_mask = None
-                        if self.decimation_method == "statistical":
-                            drop_mask = np.random.rand(*depth_map.shape) < self.decimation_ratio
-                        elif self.decimation_method == "distance":
-                            # Drop probability increases with depth (max 1.0 at max_depth)
-                            norm_depth = np.clip(depth_map / self.max_depth, 0.0, 1.0)
-                            drop_mask = np.random.rand(*depth_map.shape) < (norm_depth * self.decimation_ratio * 2.0)
-                        elif self.decimation_method == "variance":
-                            import cv2
-                            # Drop edges / high variance areas where depth jumps
-                            blurred = cv2.GaussianBlur(depth_map, (5, 5), 0)
-                            variance = np.abs(depth_map - blurred)
-                            # Normalize variance map and drop highest variance points based on ratio
-                            var_thresh = np.percentile(variance[depth_map > 0], (1.0 - self.decimation_ratio) * 100.0)
-                            drop_mask = variance > var_thresh
-                            
-                        if drop_mask is not None:
-                            depth_map[drop_mask] = 0.0
-
                     batch_depths.append(depth_map)
                     batch_rgbs.append(window_frames[j])
                     batch_masks.append(window_masks[j])
@@ -709,6 +836,12 @@ class StreamingWindowEngine:
                 self.tsdf_future = None
             profiler["TSDF_Integrate"] = time.time() - t_integ
 
+            # --- ESDF (optional, off by default) --------------------------------
+            if self.compute_esdf:
+                t_esdf = time.time()
+                self.tsdf.update_esdf()
+                profiler["ESDF_Update"] = time.time() - t_esdf
+
             # --- Geometry extraction (gated by cadence) --------------------------
             # The costly part (pulling + rebuilding the full Open3D mesh) scales with
             # TOTAL map size, so only do it every ``mesh_extract_every`` submaps.
@@ -721,6 +854,10 @@ class StreamingWindowEngine:
                 self.tsdf.update_mesh()
                 torch.cuda.synchronize()
                 profiler["Mesh_MarchingCubes"] = time.time() - t0
+
+                # New map version for this extraction; blocks the colorizer touches
+                # below are stamped with it (see _cache_update) for delta streaming.
+                self.map_version += 1
 
                 if self.point_cloud_only:
                     # Pull only vertices + triangles, derive normals on the GPU, color

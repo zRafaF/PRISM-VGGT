@@ -172,11 +172,35 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
     if not files: return "⚠️ No valid images found."
     return f"✅ Total files to process: {len(files)}\n\n" + "\n".join(f"{i + 1}. {os.path.basename(n)}" for i, n in enumerate(files))
 
+def create_esdf_figure(height):
+    """Render a horizontal ESDF slice (signed-distance heatmap) at a world height."""
+    sl = streaming_engine.get_esdf_slice(y_world=float(height))
+    if sl is None:
+        fig = go.Figure()
+        fig.update_layout(title="ESDF unavailable - enable 'Compute ESDF' and run a sequence",
+                          paper_bgcolor="#111111", font=dict(color="white"),
+                          margin=dict(l=0, r=0, b=0, t=30))
+        return fig
+    dist = sl["distance"]
+    finite = dist[np.isfinite(dist)]
+    vmax = float(np.percentile(np.abs(finite), 95)) if finite.size else 1.0
+    vmax = max(vmax, 1e-3)
+    fig = go.Figure(data=go.Heatmap(
+        x=sl["xs"], y=sl["zs"], z=np.clip(dist, -vmax, vmax),
+        colorscale="RdBu", zmid=0.0, colorbar=dict(title="dist (m)")))
+    fig.update_layout(
+        title=f"ESDF slice @ world Y={sl['y']:.2f} m  (blue=free space, red=inside/near obstacles)",
+        paper_bgcolor="#111111", font=dict(color="white"),
+        yaxis=dict(scaleanchor="x", scaleratio=1),
+        margin=dict(l=0, r=0, b=0, t=30))
+    return fig
+
+
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
     zenith_limit, nadir_limit, target_width, target_height,
     window_size, overlap, max_depth, voxel_size, camera_height, face_size, mesh_extract_every,
-    live_stream_toggle, show_ground_plane
+    compute_esdf, live_stream_toggle, show_ground_plane
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2: raise gr.Error("Please provide at least 2 valid images.")
@@ -194,6 +218,7 @@ def process_sequence_ui(
     streaming_engine.target_camera_height = float(camera_height)
     streaming_engine.face_size = int(face_size)
     streaming_engine.mesh_extract_every = int(mesh_extract_every)
+    streaming_engine.compute_esdf = bool(compute_esdf)
 
     last_mesh, last_pcd, last_traj, last_plane = None, None, None, None
     generator = streaming_engine.process_sequence(frames=frames, masks=masks, window_size=int(window_size), overlap=int(overlap))
@@ -251,6 +276,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             camera_height_slider = gr.Slider(minimum=0.1, maximum=3.0, value=CONFIG_DEFAULTS["camera_height"], step=0.1, label="Target Camera Height (m)")
             face_size_slider = gr.Slider(minimum=256, maximum=1536, value=CONFIG_DEFAULTS["face_size"], step=64, label="Cubemap Face Resolution (px) [Higher = sharper geometry, ~no gain above input width]")
             mesh_extract_slider = gr.Slider(minimum=1, maximum=10, value=CONFIG_DEFAULTS["mesh_extract_every"], step=1, label="Rebuild Mesh Every N Submaps [Higher = faster, mesh refreshes less often]")
+            compute_esdf_checkbox = gr.Checkbox(value=False, label="Compute ESDF each batch (collision distance field; adds cost)")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -264,9 +290,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
                     download_single = gr.File(label="💾 Download Frame .ply")
 
                 with gr.Tab("2. Multi-Frame 4D Stitching"):
-                    input_mode = gr.Radio(choices=["Upload Files", "Local Directory Path"], value="Upload Files", label="Input Mode")
-                    input_seq = gr.File(label="Upload Image Sequence", file_count="multiple", file_types=["image"], visible=True)
-                    local_dir_input = gr.Textbox(label="Absolute Local Directory Path", visible=False)
+                    input_mode = gr.Radio(choices=["Upload Files", "Local Directory Path"], value="Local Directory Path", label="Input Mode")
+                    input_seq = gr.File(label="Upload Image Sequence", file_count="multiple", file_types=["image"], visible=False)
+                    local_dir_input = gr.Textbox(value="examples/long", label="Absolute Local Directory Path", visible=True)
 
                     with gr.Row():
                         decimation_input = gr.Number(value=0, label="Decimation (Skip N files)", precision=0)
@@ -282,6 +308,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
                         with gr.Tab("Live Geometry (.glb)"):
                             output_mesh = gr.Model3D(label="Real-Time TSDF Mesh")
                             download_mesh = gr.File(label="💾 Download Mesh .glb")
+                        with gr.Tab("ESDF Slice"):
+                            esdf_height_slider = gr.Slider(minimum=-3.0, maximum=3.0, value=0.0, step=0.05, label="Slice height (world Y, m) - move to re-query after a run")
+                            output_esdf = gr.Plot(label="ESDF horizontal slice")
 
     def enforce_res(w, h, step, link, trig):
         step = max(1, int(step))
@@ -303,10 +332,14 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider,
             target_width, target_height, window_size_slider, overlap_slider,
             max_depth_slider, voxel_size_slider, camera_height_slider, face_size_slider, mesh_extract_slider,
-            live_stream_checkbox, show_ground_plane_checkbox
+            compute_esdf_checkbox, live_stream_checkbox, show_ground_plane_checkbox
         ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh]
     )
+
+    # ESDF slice is queried on demand from the persisted engine state, so the height
+    # slider can be explored after a run without recomputing the map.
+    esdf_height_slider.release(fn=create_esdf_figure, inputs=[esdf_height_slider], outputs=[output_esdf])
 
 if __name__ == "__main__":
     # Entry point for the PRISM-VGGT streaming sandbox.
