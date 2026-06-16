@@ -154,11 +154,13 @@ class NvbloxPanoTSDF:
             (N,) tensor of signed distances (negative = inside obstacles;
             unobserved space returns nvblox's large 'unknown' sentinel distance).
         """
-        # Query the single mapper explicitly (mapper_id=0); the multi-mapper path
-        # (-1) rejects inputs on a single-mapper setup. Ensure (N,3) contiguous f32.
+        # Query via ESDF_GRAD: the plain ESDF path allocates a (N,1) output but the
+        # underlying C++ query writes the full 4-wide voxel [grad_x, grad_y, grad_z,
+        # distance], so (N,1) is rejected ("Inputs do not have the required sizes").
+        # ESDF_GRAD allocates (N,4); we return the last column (signed distance, m).
         q = points_xyz.reshape(-1, 3).contiguous().float()
-        out = self.mapper.query_layer(QueryType.ESDF, q, mapper_id=0)
-        return out.reshape(-1)
+        out = self.mapper.query_layer(QueryType.ESDF_GRAD, q, mapper_id=0)
+        return out.reshape(-1, 4)[:, 3]
 
     def print_nvblox_timing(self):
         """Dump nvblox's internal C++ stage timers (integration, meshing, etc.)."""
