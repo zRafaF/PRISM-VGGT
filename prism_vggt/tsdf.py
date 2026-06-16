@@ -126,6 +126,19 @@ class NvbloxPanoTSDF:
         self.update_mesh()
         return self.get_color_mesh_raw().to_open3d()
 
+    def num_tsdf_blocks(self):
+        """Number of allocated TSDF blocks (a proxy for nvblox GPU memory use)."""
+        try:
+            return int(self.mapper.tsdf_layer_view(0).num_blocks())
+        except Exception:  # pragma: no cover - depends on nvblox build
+            return 0
+
+    def clear_volume(self):
+        """Clear all GPU map layers (TSDF / color / ESDF / mesh). Used to bound VRAM;
+        in point-cloud mode the full colored map is retained in the engine's CPU
+        block cache, so only the (disposable) live GPU volume is dropped."""
+        self.mapper.clear()
+
     def update_esdf(self):
         """Recompute the Euclidean Signed Distance Field from the current TSDF.
         Only needed if you query the ESDF (collision distances) for planning."""

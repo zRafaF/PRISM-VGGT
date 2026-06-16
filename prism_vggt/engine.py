@@ -87,6 +87,16 @@ class StreamingWindowEngine:
         self.map_flush_min_free_gb = 3.0    # ...or sooner if free VRAM drops below this
         self.accum_downsample = True        # voxel-downsample the accumulated cloud (dedup overlaps)
 
+        # Hard VRAM bound for point-cloud mode: when the live TSDF exceeds this many
+        # blocks, the GPU volume is cleared (the full colored map persists in the CPU
+        # block cache, so snapshot/delta streaming is unaffected). This prevents the
+        # nvblox block-hash from doubling into an out-of-memory allocation on long
+        # runs / smaller GPUs. Trade-off: the dense mesh and ESDF then only cover
+        # geometry seen since the last clear. 0 disables the bound. Raise on big GPUs.
+        # (Default is conservative: the observed OOM was a hash double around ~262k
+        # blocks, so we clear well below that.)
+        self.max_tsdf_blocks = 150_000
+
         # Minimum |cos(normal . up)| required to trust a floor detection for the
         # one-time gravity leveling of the world frame.
         self.level_min_confidence = 0.4
@@ -344,6 +354,27 @@ class StreamingWindowEngine:
         self._cache_color = np.empty((0, 3), dtype=np.float64)
         self._cache_score = np.empty((0,), dtype=np.float64)
         self._cache_version = np.empty((0,), dtype=np.int64)
+
+    def _maybe_bound_gpu_volume(self):
+        """Cap nvblox GPU memory: once the live TSDF passes ``max_tsdf_blocks``, clear
+        the GPU volume. The full colored map is preserved in the CPU block cache (so
+        snapshot/delta streaming is untouched) and re-rendered into the display
+        accumulator so local viz stays whole. Point-cloud mode only."""
+        if not self.point_cloud_only or self.max_tsdf_blocks <= 0:
+            return
+        n = self.tsdf.num_tsdf_blocks()
+        if n < self.max_tsdf_blocks:
+            return
+        if self._cache_packed.size:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(self._block_centers(self._cache_packed))
+            pcd.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(self._cache_color))
+            self.accum_pcd_cache = pcd
+        self.tsdf.clear_volume()
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"  > [VRAM] Cleared GPU volume at {n} TSDF blocks "
+              f"(full map kept in cache; dense mesh/ESDF now cover post-clear region only).")
 
     # ------------------------------------------------------------------ #
     #  Point-cloud streaming API (block-granular, version + hash based).  #
@@ -891,6 +922,9 @@ class StreamingWindowEngine:
                     self.last_pcd = display_pcd
                     self.last_mesh = None
                     display_mesh = o3d.geometry.TriangleMesh()
+
+                    # Bound nvblox GPU memory (this submap's display is already built).
+                    self._maybe_bound_gpu_volume()
                 else:
                     # Full mesh path (kept for .glb-per-submap / A-B testing).
                     t0 = time.time()
