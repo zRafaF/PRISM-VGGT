@@ -87,15 +87,12 @@ class StreamingWindowEngine:
         self.map_flush_min_free_gb = 3.0    # ...or sooner if free VRAM drops below this
         self.accum_downsample = True        # voxel-downsample the accumulated cloud (dedup overlaps)
 
-        # Hard VRAM bound for point-cloud mode: when the live TSDF exceeds this many
-        # blocks, the GPU volume is cleared (the full colored map persists in the CPU
-        # block cache, so snapshot/delta streaming is unaffected). This prevents the
-        # nvblox block-hash from doubling into an out-of-memory allocation on long
-        # runs / smaller GPUs. Trade-off: the dense mesh and ESDF then only cover
-        # geometry seen since the last clear. 0 disables the bound. Raise on big GPUs.
-        # (Default is conservative: the observed OOM was a hash double around ~262k
-        # blocks, so we clear well below that.)
-        self.max_tsdf_blocks = 150_000
+        # Opt-in last-resort VRAM bound (default OFF). When > 0, the GPU volume is
+        # cleared once it exceeds this many blocks. This bounds VRAM but DROPS the
+        # dense volume (the dense mesh/ESDF then only cover geometry seen since the
+        # clear; the streamable block cache is retained). Prefer leaving this at 0 and
+        # bounding VRAM with the planned zone-hashing instead, which keeps all data.
+        self.max_tsdf_blocks = 0
 
         # Minimum |cos(normal . up)| required to trust a floor detection for the
         # one-time gravity leveling of the world frame.
@@ -479,7 +476,11 @@ class StreamingWindowEngine:
         gy = np.full_like(gx, y_world)
         pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3).astype(np.float32)
         q = torch.from_numpy(pts).to(self.device)
-        dist = self.tsdf.query_esdf(q).cpu().numpy().reshape(gx.shape)
+        try:
+            dist = self.tsdf.query_esdf(q).cpu().numpy().reshape(gx.shape)
+        except Exception as e:  # pragma: no cover - depends on nvblox build/state
+            print(f"[Engine] ESDF query failed: {e}")
+            return None
         return {"xs": xs, "zs": zs, "distance": dist, "y": float(y_world)}
 
     @torch.no_grad()
@@ -994,12 +995,23 @@ class StreamingWindowEngine:
                 print("  --- 🧱 nvblox internal timers ---")
                 self.tsdf.print_nvblox_timing()
 
+            n_blocks = self.tsdf.num_tsdf_blocks()
+            free_now = self._free_vram_gb()
             print("  --- 💾 GPU Memory (VRAM) ---")
             print(f"    - PyTorch Peak Alloc  : {pt_alloc:.2f} GB")
             print(f"    - PyTorch Reserved    : {pt_res:.2f} GB")
             print(f"    - nvblox / Other      : {nvblox_other:.2f} GB")
-            print(f"    - System VRAM Usage   : {sys_used:.2f} GB / {sys_total:.2f} GB")
-            print(f"    - Accumulated Verts   : {len(self.accum_mesh.vertices)}")
+            print(f"    - System VRAM Usage   : {sys_used:.2f} GB / {sys_total:.2f} GB  (free {free_now:.2f} GB)")
+            print(f"    - nvblox TSDF Blocks  : {n_blocks}")
+            # nvblox grows its block hash in power-of-two steps; a resize transiently
+            # allocates the NEW buffer before freeing the old (~2x spike) ON TOP of
+            # resident perception. Warn when the next resize could exceed free VRAM.
+            if n_blocks > 0:
+                next_cap = 1 << int(np.ceil(np.log2(max(n_blocks, 1))))
+                if free_now < (pt_res + 2.0) and n_blocks > 0.6 * next_cap:
+                    print(f"    ⚠️  approaching a hash resize (~{next_cap} cap) with only "
+                          f"{free_now:.1f} GB free - risk of a transient-spike OOM. "
+                          f"Lower max_depth/voxel or set pipeline_inference=False.")
             self.submap_count += 1
 
             yield display_mesh, display_pcd, np.array(self.trajectory), self.last_floor_plane

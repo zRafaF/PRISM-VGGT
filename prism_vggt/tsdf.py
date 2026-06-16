@@ -154,7 +154,10 @@ class NvbloxPanoTSDF:
             (N,) tensor of signed distances (negative = inside obstacles;
             unobserved space returns nvblox's large 'unknown' sentinel distance).
         """
-        out = self.mapper.query_layer(QueryType.ESDF, points_xyz)
+        # Query the single mapper explicitly (mapper_id=0); the multi-mapper path
+        # (-1) rejects inputs on a single-mapper setup. Ensure (N,3) contiguous f32.
+        q = points_xyz.reshape(-1, 3).contiguous().float()
+        out = self.mapper.query_layer(QueryType.ESDF, q, mapper_id=0)
         return out.reshape(-1)
 
     def print_nvblox_timing(self):
