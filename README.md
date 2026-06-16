@@ -114,9 +114,12 @@ refetch. (Block *removal*, e.g. via TSDF decay, is not tracked yet.)
 ```python
 engine.compute_esdf = True                  # recompute the ESDF each submap (off by default)
 # ... after running process_sequence ...
-sl = engine.get_esdf_slice(y_world=0.0)     # horizontal slice of signed distances
-# sl -> {"xs", "zs", "distance" (Hz x Wx, meters), "y"}
+sl = engine.get_esdf_slice(height=1.0)      # horizontal (constant-Z) slice, Z-up, floor at 0
+# sl -> {"xs", "ys", "distance" (Hy x Wx, meters), "z", "valid"}
 ```
+
+The world frame is **Z-up, right-handed** (ROS REP-103 / nvblox): the floor is at
+`Z = 0` and an upright camera sits at `Z ~= camera_height`.
 
 #### Performance / parallelism
 

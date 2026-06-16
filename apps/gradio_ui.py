@@ -74,6 +74,8 @@ def create_plotly_figure_from_pcd(pcd, max_points=150000):
         points, colors = points[idx], colors[idx]
 
     colors_str = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in colors]
+    # Single-frame preview is in the raw camera frame (Y-down), so remap to show it
+    # upright (the leveled sequence map below is already Z-up and plotted natively).
     fig = go.Figure(data=[go.Scatter3d(x=points[:, 0], y=points[:, 2], z=-points[:, 1], mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0))])
     fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111")
     return fig
@@ -103,7 +105,7 @@ def add_ground_plane_trace(fig, plane, size_scale=1.5):
         c + ext * u + ext * v,
         c - ext * u + ext * v,
     ])
-    X, Y, Z = corners[:, 0], corners[:, 2], -corners[:, 1]
+    X, Y, Z = corners[:, 0], corners[:, 1], corners[:, 2]
     fig.add_trace(go.Mesh3d(
         x=X, y=Y, z=Z,
         i=[0, 0], j=[1, 2], k=[2, 3],
@@ -122,11 +124,11 @@ def create_plotly_figure_with_trajectory(pcd, trajectory, plane=None, show_groun
     colors_str = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in colors]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter3d(x=points[:, 0], y=points[:, 2], z=-points[:, 1], mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0), name='Geometry'))
+    fig.add_trace(go.Scatter3d(x=points[:, 0], y=points[:, 1], z=points[:, 2], mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0), name='Geometry'))
 
     if trajectory is not None and len(trajectory) > 0:
         fig.add_trace(go.Scatter3d(
-            x=trajectory[:, 0], y=trajectory[:, 2], z=-trajectory[:, 1],
+            x=trajectory[:, 0], y=trajectory[:, 1], z=trajectory[:, 2],
             mode='lines+markers', name='Camera Trajectory',
             line=dict(color='cyan', width=4), marker=dict(size=4, color='orange')
         ))
@@ -173,23 +175,24 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
     return f"✅ Total files to process: {len(files)}\n\n" + "\n".join(f"{i + 1}. {os.path.basename(n)}" for i, n in enumerate(files))
 
 def create_esdf_figure(height):
-    """Render a horizontal ESDF slice (signed-distance heatmap) at a world height."""
-    sl = streaming_engine.get_esdf_slice(y_world=float(height))
-    if sl is None:
+    """Render a horizontal ESDF slice (signed-distance heatmap) at world height Z."""
+    sl = streaming_engine.get_esdf_slice(height=float(height))
+    if sl is None or sl.get("valid", 0) == 0:
+        msg = ("ESDF unavailable - enable 'Compute ESDF' and run a sequence"
+               if sl is None else
+               f"No observed ESDF cells at Z={float(height):.2f} m - try another height")
         fig = go.Figure()
-        fig.update_layout(title="ESDF unavailable - enable 'Compute ESDF' and run a sequence",
-                          paper_bgcolor="#111111", font=dict(color="white"),
+        fig.update_layout(title=msg, paper_bgcolor="#111111", font=dict(color="white"),
                           margin=dict(l=0, r=0, b=0, t=30))
         return fig
     dist = sl["distance"]
     finite = dist[np.isfinite(dist)]
-    vmax = float(np.percentile(np.abs(finite), 95)) if finite.size else 1.0
-    vmax = max(vmax, 1e-3)
+    vmax = max(float(np.percentile(np.abs(finite), 95)) if finite.size else 1.0, 1e-3)
     fig = go.Figure(data=go.Heatmap(
-        x=sl["xs"], y=sl["zs"], z=np.clip(dist, -vmax, vmax),
+        x=sl["xs"], y=sl["ys"], z=np.clip(dist, -vmax, vmax),
         colorscale="RdBu", zmid=0.0, colorbar=dict(title="dist (m)")))
     fig.update_layout(
-        title=f"ESDF slice @ world Y={sl['y']:.2f} m  (blue=free space, red=inside/near obstacles)",
+        title=f"ESDF slice @ Z={sl['z']:.2f} m  (blue=free space, red=inside/near obstacles)",
         paper_bgcolor="#111111", font=dict(color="white"),
         yaxis=dict(scaleanchor="x", scaleratio=1),
         margin=dict(l=0, r=0, b=0, t=30))
@@ -309,7 +312,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
                             output_mesh = gr.Model3D(label="Real-Time TSDF Mesh")
                             download_mesh = gr.File(label="💾 Download Mesh .glb")
                         with gr.Tab("ESDF Slice"):
-                            esdf_height_slider = gr.Slider(minimum=-3.0, maximum=3.0, value=0.0, step=0.05, label="Slice height (world Y, m) - move to re-query after a run")
+                            esdf_height_slider = gr.Slider(minimum=0.0, maximum=2.6, value=1.0, step=0.05, label="Slice height (world Z above floor, m) - move to re-query after a run")
                             output_esdf = gr.Plot(label="ESDF horizontal slice")
 
     def enforce_res(w, h, step, link, trig):

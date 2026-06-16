@@ -6,6 +6,7 @@ import open3d as o3d
 from nvblox_torch.mapper import Mapper, QueryType
 from nvblox_torch.sensor import Sensor
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
+from nvblox_torch.constants import constants
 
 class NvbloxPanoTSDF:
     def __init__(self, voxel_size_m=0.02, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
@@ -133,34 +134,34 @@ class NvbloxPanoTSDF:
         except Exception:  # pragma: no cover - depends on nvblox build
             return 0
 
-    def clear_volume(self):
-        """Clear all GPU map layers (TSDF / color / ESDF / mesh). Used to bound VRAM;
-        in point-cloud mode the full colored map is retained in the engine's CPU
-        block cache, so only the (disposable) live GPU volume is dropped."""
-        self.mapper.clear()
-
     def update_esdf(self):
         """Recompute the Euclidean Signed Distance Field from the current TSDF.
         Only needed if you query the ESDF (collision distances) for planning."""
         self.mapper.update_esdf()
 
-    @torch.no_grad()
     def query_esdf(self, points_xyz):
         """Query ESDF distance (meters) at Nx3 world points.
 
+        Mirrors nvblox's own ESDF example, which queries through
+        ``query_differentiable_layer(QueryType.ESDF, ...)`` (the plain ``query_layer``
+        ESDF path mis-allocates its output and fails with "Inputs do not have the
+        required sizes").
+
         Args:
-            points_xyz: (N, 3) float32 CUDA tensor of world coordinates.
+            points_xyz: (N, 3) CUDA tensor of world coordinates.
         Returns:
-            (N,) tensor of signed distances (negative = inside obstacles;
-            unobserved space returns nvblox's large 'unknown' sentinel distance).
+            (N,) tensor of signed distances in meters (negative = inside obstacles).
+            Unobserved points are returned as NaN (nvblox's 'unknown' sentinel).
         """
-        # Query via ESDF_GRAD: the plain ESDF path allocates a (N,1) output but the
-        # underlying C++ query writes the full 4-wide voxel [grad_x, grad_y, grad_z,
-        # distance], so (N,1) is rejected ("Inputs do not have the required sizes").
-        # ESDF_GRAD allocates (N,4); we return the last column (signed distance, m).
         q = points_xyz.reshape(-1, 3).contiguous().float()
-        out = self.mapper.query_layer(QueryType.ESDF_GRAD, q, mapper_id=0)
-        return out.reshape(-1, 4)[:, 3]
+        # Run with grad enabled (as nvblox's own example does); the autograd-backed
+        # ESDF query can misbehave under no_grad. We detach the result for the caller.
+        with torch.enable_grad():
+            sdf = self.mapper.query_differentiable_layer(QueryType.ESDF, q).reshape(-1)
+        sdf = sdf.detach()
+        # Mask nvblox's "unknown" sentinel (unobserved space) as NaN for clean viz.
+        unknown = float(constants.esdf_unknown_distance())
+        return torch.where(sdf >= unknown - 1e-3, torch.full_like(sdf, float("nan")), sdf)
 
     def print_nvblox_timing(self):
         """Dump nvblox's internal C++ stage timers (integration, meshing, etc.)."""

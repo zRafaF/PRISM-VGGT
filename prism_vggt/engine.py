@@ -87,20 +87,6 @@ class StreamingWindowEngine:
         self.map_flush_min_free_gb = 3.0    # ...or sooner if free VRAM drops below this
         self.accum_downsample = True        # voxel-downsample the accumulated cloud (dedup overlaps)
 
-        # --- Rolling VRAM bound (non-lossy, default ON) -----------------------
-        # Flattens nvblox GPU memory on long runs *without* losing data: once the
-        # live TSDF exceeds ``max_tsdf_blocks`` blocks, the current dense colored
-        # cloud is offloaded to a persistent (deduplicated) CPU accumulator, THEN the
-        # GPU volume is cleared. The full dense map therefore lives on the CPU and is
-        # still displayed/streamed; the GPU only ever holds the recent (active)
-        # region -- the practical realization of "only keep the zones we're mapping
-        # resident", given nvblox can only clear the whole volume at once.
-        # Caveat: the ESDF (which needs the live GPU TSDF) only covers the region
-        # since the last offload; and revisited areas re-fuse rather than refine
-        # (dedup mitigates double surfaces). Set rolling_vram_bound=False to keep the
-        # entire volume on the GPU (full-map ESDF, but will OOM on long runs).
-        self.rolling_vram_bound = True
-        self.max_tsdf_blocks = 120_000
 
         # Minimum |cos(normal . up)| required to trust a floor detection for the
         # one-time gravity leveling of the world frame.
@@ -360,44 +346,6 @@ class StreamingWindowEngine:
         self._cache_score = np.empty((0,), dtype=np.float64)
         self._cache_version = np.empty((0,), dtype=np.int64)
 
-    def _maybe_bound_gpu_volume(self, v_np, colors_np):
-        """Flatten nvblox GPU memory WITHOUT losing data (point-cloud mode).
-
-        Once the live TSDF exceeds ``max_tsdf_blocks``, the current dense colored
-        cloud (this is the full GPU mesh since the last offload) is appended to a
-        persistent, voxel-deduplicated CPU accumulator, and only THEN is the GPU
-        volume cleared. The accumulator (``accum_pcd_cache``) is folded into the
-        display/stream by ``_pcd_from_arrays``, so the full dense map remains visible
-        while the GPU only ever holds the recent region.
-        """
-        if not self.rolling_vram_bound or self.max_tsdf_blocks <= 0 or not self.point_cloud_only:
-            return
-        n = self.tsdf.num_tsdf_blocks()
-        if n < self.max_tsdf_blocks:
-            return
-
-        # 1) Offload the current dense colored cloud into the CPU accumulator.
-        valid = colors_np.sum(axis=1) > 0.0
-        if valid.any():
-            pts = [v_np[valid]]
-            cols = [colors_np[valid]]
-            if len(self.accum_pcd_cache.points) > 0:
-                pts.append(np.asarray(self.accum_pcd_cache.points))
-                cols.append(np.asarray(self.accum_pcd_cache.colors))
-            merged = o3d.geometry.PointCloud()
-            merged.points = o3d.utility.Vector3dVector(np.concatenate(pts, axis=0))
-            merged.colors = o3d.utility.Vector3dVector(np.concatenate(cols, axis=0))
-            if self.accum_downsample and self.voxel_size > 0:
-                merged = merged.voxel_down_sample(self.voxel_size)
-            self.accum_pcd_cache = merged
-
-        # 2) Clear the GPU volume now that its geometry is safe on the CPU.
-        self.tsdf.clear_volume()
-        gc.collect()
-        torch.cuda.empty_cache()
-        print(f"  > [VRAM] Offloaded dense cloud + cleared GPU volume at {n} TSDF blocks "
-              f"(accumulator now {len(self.accum_pcd_cache.points)} pts; ESDF covers post-offload region).")
-
     # ------------------------------------------------------------------ #
     #  Point-cloud streaming API (block-granular, version + hash based).  #
     #  The streamable cloud is one point per color block (voxel_size *    #
@@ -470,35 +418,37 @@ class StreamingWindowEngine:
         changed = self._cache_version > int(since_version)
         return self._pack_cloud(self._cache_packed[changed], self._cache_color[changed], since_version)
 
-    @torch.no_grad()
-    def get_esdf_slice(self, y_world=None, bounds=None, resolution=None, margin=1.0):
-        """Sample the ESDF on a horizontal (constant world-Y) grid, for viz/planning.
+    def get_esdf_slice(self, height=None, bounds=None, resolution=None, margin=1.0):
+        """Sample the ESDF on a horizontal (constant-Z) grid, for viz/planning.
+
+        World is Z-up (floor at Z=0), so a horizontal slice spans X-Y at a fixed Z.
 
         Args:
-            y_world: world Y of the slice plane. Defaults to the trajectory mean Y.
-            bounds: (x_min, x_max, z_min, z_max). Defaults to trajectory extent + margin.
+            height: world Z of the slice plane (meters above the floor). Defaults to
+                ~half the trajectory's typical standing height.
+            bounds: (x_min, x_max, y_min, y_max). Defaults to trajectory extent + margin.
             resolution: meters between samples (defaults to esdf_slice_resolution).
         Returns:
-            dict {xs (Wx,), zs (Hz,), distance (Hz, Wx), y} of ESDF distances in
-            meters, or None if ESDF isn't being computed or the map is empty.
+            dict {xs (Wx,), ys (Hy,), distance (Hy, Wx), z, valid} of ESDF distances
+            in meters (unobserved = NaN), or None if ESDF isn't being computed / empty.
         """
         if not self.compute_esdf or len(self.trajectory) == 0:
             return None
         traj = np.asarray(self.trajectory)
         if bounds is None:
             x_min, x_max = traj[:, 0].min() - margin, traj[:, 0].max() + margin
-            z_min, z_max = traj[:, 2].min() - margin, traj[:, 2].max() + margin
+            y_min, y_max = traj[:, 1].min() - margin, traj[:, 1].max() + margin
         else:
-            x_min, x_max, z_min, z_max = bounds
-        if y_world is None:
-            y_world = float(traj[:, 1].mean())
+            x_min, x_max, y_min, y_max = bounds
+        if height is None:
+            height = float(np.median(traj[:, 2]))   # ~camera/standing height
         res = float(resolution or self.esdf_slice_resolution)
         xs = np.arange(x_min, x_max, res, dtype=np.float32)
-        zs = np.arange(z_min, z_max, res, dtype=np.float32)
-        if xs.size == 0 or zs.size == 0:
+        ys = np.arange(y_min, y_max, res, dtype=np.float32)
+        if xs.size == 0 or ys.size == 0:
             return None
-        gx, gz = np.meshgrid(xs, zs)               # (Hz, Wx)
-        gy = np.full_like(gx, y_world)
+        gx, gy = np.meshgrid(xs, ys)               # (Hy, Wx)
+        gz = np.full_like(gx, height)
         pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3).astype(np.float32)
         q = torch.from_numpy(pts).to(self.device)
         try:
@@ -506,7 +456,9 @@ class StreamingWindowEngine:
         except Exception as e:  # pragma: no cover - depends on nvblox build/state
             print(f"[Engine] ESDF query failed: {e}")
             return None
-        return {"xs": xs, "zs": zs, "distance": dist, "y": float(y_world)}
+        valid = int(np.isfinite(dist).sum())
+        print(f"[Engine] ESDF slice @ Z={height:.2f}m: {valid}/{dist.size} observed cells.")
+        return {"xs": xs, "ys": ys, "distance": dist, "z": float(height), "valid": valid}
 
     @torch.no_grad()
     def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
@@ -770,29 +722,33 @@ class StreamingWindowEngine:
             origin_inv = np.linalg.inv(poses[0])
             canonical_native = [origin_inv @ p for p in poses]
 
-            # --- Gravity leveling (one-time, first confident floor) --------------
-            # Rotate the world frame so the detected floor normal points along world
-            # "up" (-Y, OpenCV down). Baked into the anchor below so nvblox builds the
-            # whole map level; later windows inherit it via the already-leveled poses.
-            if self.is_first_window and not self.is_leveled and floor_plane is not None and floor_conf >= self.level_min_confidence:
-                n_local = floor_plane["normal"]
-                n_canonical = canonical_native[mid_idx][:3, :3] @ n_local
-                R_level = rotation_aligning_vectors(n_canonical, np.array([0.0, -1.0, 0.0]))
-                self.world_align = np.eye(4)
-                self.world_align[:3, :3] = R_level
-                self.is_leveled = True
-                print(f"  > [Leveling] World frame aligned to floor (conf={floor_conf:.2f}).")
-
             # --- Sim3 anchor (s, R, t): native submap frame -> world meters ------
+            # World convention: Z-up, right-handed (ROS REP-103 / nvblox standard).
+            # The floor is placed at Z=0, so an upright camera sits at ~+camera height.
             if self.is_first_window:
                 # First submap defines absolute metric scale from the floor (fallback
-                # to a median-depth guess); the leveling rotation orients it upright.
+                # to a median-depth guess).
                 if floor_scale is not None:
                     s_anchor = floor_scale
                 else:
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
                     s_anchor = (3.0 / np.median(valid_depths)) if len(valid_depths) > 0 else 1.0
+
+                # Gravity leveling (one-time, first confident floor): rotate so the
+                # floor normal points to world +Z, then translate so the floor is at
+                # Z=0. Baked into the anchor; later windows inherit it via the chain.
+                if not self.is_leveled and floor_plane is not None and floor_conf >= self.level_min_confidence:
+                    n_canonical = canonical_native[mid_idx][:3, :3] @ floor_plane["normal"]
+                    R_level = rotation_aligning_vectors(n_canonical, np.array([0.0, 0.0, 1.0]))
+                    c_can = (canonical_native[mid_idx] @ np.append(floor_plane["centroid"], 1.0))[:3]
+                    floor_z = float((R_level @ (s_anchor * c_can))[2])
+                    self.world_align = np.eye(4)
+                    self.world_align[:3, :3] = R_level
+                    self.world_align[2, 3] = -floor_z          # shift floor onto Z=0
+                    self.is_leveled = True
+                    print(f"  > [Leveling] Z-up world, floor at Z=0 (conf={floor_conf:.2f}).")
+
                 R_anchor = self.world_align[:3, :3].copy()
                 t_anchor = self.world_align[:3, 3].copy()
             else:
@@ -856,7 +812,10 @@ class StreamingWindowEngine:
 
                     tsdf_pose = global_pose.copy()
 
-                    if tsdf_pose[1, 1] < 0:
+                    # Cubemap upside-down guard. The camera's down axis (col 1, image
+                    # +Y) should point toward world -Z; if it points +Z the camera is
+                    # flipped, so rotate 180 deg about its X to re-orient the faces.
+                    if tsdf_pose[2, 1] > 0:
                         tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
 
                     scaled_pts = pts_list[j] * self.current_metric_scale
@@ -948,10 +907,6 @@ class StreamingWindowEngine:
                     self.last_pcd = display_pcd
                     self.last_mesh = None
                     display_mesh = o3d.geometry.TriangleMesh()
-
-                    # Bound nvblox GPU memory (this submap's display is already built);
-                    # offloads this dense cloud to the CPU accumulator before clearing.
-                    self._maybe_bound_gpu_volume(v_np, colors_np)
                 else:
                     # Full mesh path (kept for .glb-per-submap / A-B testing).
                     t0 = time.time()
