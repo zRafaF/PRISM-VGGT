@@ -32,6 +32,7 @@ CONFIG_DEFAULTS = {
     "camera_height": 1.7,
     "face_size": 768,
     "mesh_extract_every": 1,
+    "sensor_mode": "lidar",
 }
 
 print("[UI] Initializing Architecture Stack...")
@@ -176,7 +177,7 @@ def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
     zenith_limit, nadir_limit, target_width, target_height,
     window_size, overlap, max_depth, voxel_size, camera_height, face_size, mesh_extract_every,
-    live_stream_toggle, show_ground_plane
+    sensor_mode, live_stream_toggle, show_ground_plane
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2: raise gr.Error("Please provide at least 2 valid images.")
@@ -194,6 +195,7 @@ def process_sequence_ui(
     streaming_engine.target_camera_height = float(camera_height)
     streaming_engine.face_size = int(face_size)
     streaming_engine.mesh_extract_every = int(mesh_extract_every)
+    streaming_engine.sensor_mode = str(sensor_mode)
 
     last_mesh, last_pcd, last_traj, last_plane = None, None, None, None
     generator = streaming_engine.process_sequence(frames=frames, masks=masks, window_size=int(window_size), overlap=int(overlap))
@@ -251,6 +253,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             camera_height_slider = gr.Slider(minimum=0.1, maximum=3.0, value=CONFIG_DEFAULTS["camera_height"], step=0.1, label="Target Camera Height (m)")
             face_size_slider = gr.Slider(minimum=256, maximum=1536, value=CONFIG_DEFAULTS["face_size"], step=64, label="Cubemap Face Resolution (px) [Higher = sharper geometry, ~no gain above input width]")
             mesh_extract_slider = gr.Slider(minimum=1, maximum=10, value=CONFIG_DEFAULTS["mesh_extract_every"], step=1, label="Rebuild Mesh Every N Submaps [Higher = faster, mesh refreshes less often]")
+            sensor_mode_radio = gr.Radio(choices=["lidar", "cubemap"], value=CONFIG_DEFAULTS["sensor_mode"], label="Depth Integration Sensor [lidar = 1 spherical frame, cubemap = 6 faces]")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -303,7 +306,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider,
             target_width, target_height, window_size_slider, overlap_slider,
             max_depth_slider, voxel_size_slider, camera_height_slider, face_size_slider, mesh_extract_slider,
-            live_stream_checkbox, show_ground_plane_checkbox
+            sensor_mode_radio, live_stream_checkbox, show_ground_plane_checkbox
         ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh]
     )

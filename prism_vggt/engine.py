@@ -68,6 +68,13 @@ class StreamingWindowEngine:
         # built once at sequence end. Set False to restore the per-submap mesh.
         self.point_cloud_only = True
 
+        # --- Depth -> nvblox sensor mode --------------------------------------
+        # "cubemap": reproject the equirect panorama onto 6 pinhole faces (6
+        #   add_depth_frame + grid_sample per keyframe). "lidar": feed the equirect
+        #   range map directly as one spherical frame per keyframe (~6x fewer
+        #   integration calls, no grid_sample, no face_size/seams).
+        self.sensor_mode = "cubemap"
+
         # --- nvblox VRAM bounding ---------------------------------------------
         # The nvblox TSDF volume grows with explored area; on a streaming run it
         # eventually exhausts VRAM when its block hash doubles. To keep ALL the
@@ -133,6 +140,7 @@ class StreamingWindowEngine:
             max_depth=self.max_depth,
             face_size=self.face_size,
             crop_margin=self.crop_margin,
+            sensor_mode=self.sensor_mode,
             device=self.device
         )
         
@@ -651,7 +659,9 @@ class StreamingWindowEngine:
 
                     tsdf_pose = global_pose.copy()
 
-                    if tsdf_pose[1, 1] < 0:
+                    # Cubemap-only orientation hack; the lidar path is convention-clean
+                    # via its fixed lidar->camera rotation, so it uses the raw pose.
+                    if self.sensor_mode != "lidar" and tsdf_pose[1, 1] < 0:
                         tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
 
                     scaled_pts = pts_list[j] * self.current_metric_scale

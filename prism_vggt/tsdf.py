@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -8,33 +9,43 @@ from nvblox_torch.sensor import Sensor
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 
 class NvbloxPanoTSDF:
-    def __init__(self, voxel_size_m=0.02, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
+    def __init__(self, voxel_size_m=0.02, max_depth=4.5, face_size=1024, crop_margin=24,
+                 sensor_mode="cubemap", device="cuda"):
         self.device = torch.device(device)
         self.voxel_size_m = voxel_size_m
-        self.max_depth = max_depth 
+        self.max_depth = max_depth
         self.face_size = face_size
         self.crop_margin = crop_margin
-        
-        print(f"[TSDF] Initializing C++ Nvblox Mapper ({voxel_size_m}m Voxels, {max_depth}m Cap)...")
-        
+        self.sensor_mode = sensor_mode
+
+        print(f"[TSDF] Initializing C++ Nvblox Mapper ({voxel_size_m}m Voxels, {max_depth}m Cap, sensor={sensor_mode})...")
+
         proj_params = ProjectiveIntegratorParams()
         proj_params.projective_integrator_max_integration_distance_m = self.max_depth
-        
+
         mapper_params = MapperParams()
         mapper_params.set_projective_integrator_params(proj_params)
-        
+
         self.mapper = Mapper(
             voxel_sizes_m=self.voxel_size_m,
             mapper_parameters=mapper_params
         )
-        
-        f = self.face_size / 2.0
-        w = self.face_size - (2 * self.crop_margin)
-        h = self.face_size - (2 * self.crop_margin)
-        c = w / 2.0 
-        
-        self.camera = Sensor.from_camera(fu=f, fv=f, cu=c, cv=c, width=w, height=h)
-        self._precompute_cubemap_grids()
+
+        if self.sensor_mode == "lidar":
+            # Single spherical (lidar) frame per keyframe: the equirect range map is
+            # fed directly, so no cubemap / grid_sample. Sensor + lidar->camera
+            # rotation are built lazily on the first frame (we need H, W).
+            self.lidar = None
+            self.T_c_l = None
+            print("[TSDF] Sensor mode: LIDAR (1 spherical frame/keyframe, no cubemap).")
+        else:
+            f = self.face_size / 2.0
+            w = self.face_size - (2 * self.crop_margin)
+            h = self.face_size - (2 * self.crop_margin)
+            c = w / 2.0
+
+            self.camera = Sensor.from_camera(fu=f, fv=f, cu=c, cv=c, width=w, height=h)
+            self._precompute_cubemap_grids()
 
     def _precompute_cubemap_grids(self):
         u = torch.linspace(-1, 1, self.face_size, device=self.device)
@@ -65,13 +76,88 @@ class NvbloxPanoTSDF:
 
     @torch.no_grad()
     def integrate(self, pano_depth_map, pano_rgb, mask, pose):
+        if self.sensor_mode == "lidar":
+            return self._integrate_lidar(pano_depth_map, mask, pose)
+        return self._integrate_cubemap(pano_depth_map, pano_rgb, mask, pose)
+
+    def _ensure_lidar(self, H, W):
+        """Lazily build the nvblox Lidar sensor and the fixed lidar->camera rotation.
+
+        Mapping (derived from nvblox/sensors/lidar.h against PanoVGGT's equirect
+        convention theta=(u/W-0.5)*2pi, phi=(v/H-0.5)*pi):
+          * nvblox ray(u,v) = (cos az cos e, sin az cos e, sin e), az from +X, Z up.
+          * equirect ray    = (cos phi sin th, sin phi, cos phi cos th), th from +Z, Y up.
+          * With e=phi, az=theta these are a cyclic permutation -> fixed rotation
+            R_c_l = [[0,1,0],[0,0,1],[1,0,0]] (lidar axes expressed in camera frame).
+          * nvblox rows run elevation +pi/2 (row 0) -> -pi/2; equirect runs -pi/2 ->
+            +pi/2, so the depth rows are remapped (exact gather, see row_map below).
+        """
+        if self.lidar is not None:
+            return
+        if W % 2 != 0:
+            raise ValueError(f"nvblox lidar requires an even azimuth count; got width={W}.")
+        self.lidar = Sensor.from_lidar(
+            num_azimuth_divisions=W,
+            num_elevation_divisions=H,
+            vertical_fov_rad=math.pi,        # full sphere (poles are masked upstream)
+            min_valid_range_m=0.1,
+        )
+        R = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.float32)
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R
+        self.T_c_l = torch.from_numpy(T).to(self.device)
+
+        # Exact inverse of nvblox's elevation sampling: lidar row r samples the
+        # equirect row whose elevation matches lidar row r. (Verified to 0 px vs a
+        # plain vertical flip's ~1.5 px systematic offset.)
+        row_map = np.clip(np.round(H * (1.0 - np.arange(H) / (H - 1))).astype(np.int64), 0, H - 1)
+        self.lidar_row_map = torch.from_numpy(row_map).to(self.device)
+        print(f"[TSDF] Lidar sensor ready ({W}x{H}, 180deg vertical FOV).")
+
+    @torch.no_grad()
+    def _integrate_lidar(self, pano_depth_map, mask, pose):
         if isinstance(pano_depth_map, np.ndarray):
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
         if isinstance(pose, np.ndarray):
             pose = torch.from_numpy(pose).float().to(self.device)
-            
+        if torch.isnan(pose).any() or torch.isinf(pose).any():
+            return
+
+        H, W = pano_depth_map.shape
+        self._ensure_lidar(H, W)
+
+        if mask is not None:
+            mask = torch.from_numpy(mask.copy()).float().to(self.device) if isinstance(mask, np.ndarray) else mask.float()
+        else:
+            mask = torch.ones_like(pano_depth_map)
+
+        # Anti-erosion edge detection (identical to the cubemap path).
+        diff_x = torch.abs(pano_depth_map - torch.roll(pano_depth_map, shifts=-1, dims=1))
+        diff_y = torch.abs(pano_depth_map - torch.roll(pano_depth_map, shifts=-1, dims=0))
+        mask = mask * ((diff_x < 0.08) & (diff_y < 0.08)).float()
+        edges = ((diff_x > 0.15) | (diff_y > 0.15)).float().unsqueeze(0).unsqueeze(0)
+        dilated = F.max_pool2d(edges, kernel_size=7, stride=1, padding=3).squeeze()
+        mask = mask * (dilated == 0.0).float()
+
+        depth = torch.nan_to_num(pano_depth_map, nan=0.0, posinf=0.0, neginf=0.0).clone()
+        invalid = (mask < 0.5) | (depth > self.max_depth) | (depth < 0.1)
+        depth[invalid] = 0.0  # 0 -> invalid pixel, ignored by the integrator
+
+        # Reorder rows into nvblox lidar elevation order (exact gather, see
+        # _ensure_lidar) and feed the equirect range map as ONE spherical frame.
+        lidar_depth = depth[self.lidar_row_map].contiguous()
+        lidar_pose = pose @ self.T_c_l   # T_w_l = T_w_c @ T_c_l
+        self.mapper.add_depth_frame(lidar_depth, lidar_pose.cpu(), self.lidar)
+
+    @torch.no_grad()
+    def _integrate_cubemap(self, pano_depth_map, pano_rgb, mask, pose):
+        if isinstance(pano_depth_map, np.ndarray):
+            pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
+        if isinstance(pose, np.ndarray):
+            pose = torch.from_numpy(pose).float().to(self.device)
+
         if torch.isnan(pose).any() or torch.isinf(pose).any(): return
-            
+
         if mask is not None:
             mask = torch.from_numpy(mask.copy()).float().to(self.device) if isinstance(mask, np.ndarray) else mask.float()
         else:
