@@ -32,6 +32,8 @@ CONFIG_DEFAULTS = {
     "camera_height": 1.7,
     "face_size": 768,
     "mesh_extract_every": 1,
+    "compute_esdf": True,
+    "world_frame": "floor",
 }
 
 print("[UI] Initializing Architecture Stack...")
@@ -114,7 +116,23 @@ def add_ground_plane_trace(fig, plane, size_scale=1.5):
     ))
 
 
-def create_plotly_figure_with_trajectory(pcd, trajectory, plane=None, show_ground_plane=False, max_points=150000):
+def add_esdf_plane_trace(fig, height):
+    """Overlay the ESDF as a horizontal colored plane at world Z=height (Z-up)."""
+    sl = streaming_engine.get_esdf_slice(height=float(height))
+    if sl is None or sl.get("valid", 0) == 0:
+        return
+    dist = sl["distance"]
+    finite = dist[np.isfinite(dist)]
+    vmax = max(float(np.percentile(np.abs(finite), 95)) if finite.size else 1.0, 1e-3)
+    z_plane = np.full_like(dist, float(sl["z"]))
+    fig.add_trace(go.Surface(
+        x=sl["xs"], y=sl["ys"], z=z_plane, surfacecolor=np.clip(dist, -vmax, vmax),
+        colorscale="RdBu", cmid=0.0, opacity=0.85, showscale=True,
+        colorbar=dict(title="ESDF (m)", x=1.02), name="ESDF"))
+
+
+def create_plotly_figure_with_trajectory(pcd, trajectory, plane=None, show_ground_plane=False,
+                                         esdf_show=False, esdf_height=1.0, max_points=150000):
     points = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors) * 255
     if len(points) > max_points:
@@ -135,6 +153,9 @@ def create_plotly_figure_with_trajectory(pcd, trajectory, plane=None, show_groun
 
     if show_ground_plane:
         add_ground_plane_trace(fig, plane)
+
+    if esdf_show:
+        add_esdf_plane_trace(fig, esdf_height)
 
     fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111", legend=dict(x=0.02, y=0.98, font=dict(color="white")))
     return fig
@@ -174,36 +195,13 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
     if not files: return "⚠️ No valid images found."
     return f"✅ Total files to process: {len(files)}\n\n" + "\n".join(f"{i + 1}. {os.path.basename(n)}" for i, n in enumerate(files))
 
-def create_esdf_figure(height):
-    """Render a horizontal ESDF slice (signed-distance heatmap) at world height Z."""
-    sl = streaming_engine.get_esdf_slice(height=float(height))
-    if sl is None or sl.get("valid", 0) == 0:
-        msg = ("ESDF unavailable - enable 'Compute ESDF' and run a sequence"
-               if sl is None else
-               f"No observed ESDF cells at Z={float(height):.2f} m - try another height")
-        fig = go.Figure()
-        fig.update_layout(title=msg, paper_bgcolor="#111111", font=dict(color="white"),
-                          margin=dict(l=0, r=0, b=0, t=30))
-        return fig
-    dist = sl["distance"]
-    finite = dist[np.isfinite(dist)]
-    vmax = max(float(np.percentile(np.abs(finite), 95)) if finite.size else 1.0, 1e-3)
-    fig = go.Figure(data=go.Heatmap(
-        x=sl["xs"], y=sl["ys"], z=np.clip(dist, -vmax, vmax),
-        colorscale="RdBu", zmid=0.0, colorbar=dict(title="dist (m)")))
-    fig.update_layout(
-        title=f"ESDF slice @ Z={sl['z']:.2f} m  (blue=free space, red=inside/near obstacles)",
-        paper_bgcolor="#111111", font=dict(color="white"),
-        yaxis=dict(scaleanchor="x", scaleratio=1),
-        margin=dict(l=0, r=0, b=0, t=30))
-    return fig
 
 
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
     zenith_limit, nadir_limit, target_width, target_height,
     window_size, overlap, max_depth, voxel_size, camera_height, face_size, mesh_extract_every,
-    compute_esdf, live_stream_toggle, show_ground_plane
+    compute_esdf, world_frame, live_stream_toggle, show_ground_plane
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2: raise gr.Error("Please provide at least 2 valid images.")
@@ -222,6 +220,7 @@ def process_sequence_ui(
     streaming_engine.face_size = int(face_size)
     streaming_engine.mesh_extract_every = int(mesh_extract_every)
     streaming_engine.compute_esdf = bool(compute_esdf)
+    streaming_engine.world_frame = str(world_frame)
 
     last_mesh, last_pcd, last_traj, last_plane = None, None, None, None
     generator = streaming_engine.process_sequence(frames=frames, masks=masks, window_size=int(window_size), overlap=int(overlap))
@@ -238,6 +237,11 @@ def process_sequence_ui(
                 mesh_path = save_mesh_to_glb(mesh, "final_scene")
                 yield fig, pcd_path, mesh_path, mesh_path
 
+    # Persist the final map so the ESDF plane / ground toggles can re-render the
+    # Real-Time Map tab on demand without re-running the sequence.
+    backend_state.update({"last_pcd": last_pcd, "last_traj": last_traj,
+                          "last_plane": last_plane, "show_ground": show_ground_plane})
+
     if last_pcd is not None:
         fig = create_plotly_figure_with_trajectory(last_pcd, last_traj, last_plane, show_ground_plane)
         pcd_path = save_pcd_to_ply(last_pcd, "live_map")
@@ -247,6 +251,20 @@ def process_sequence_ui(
             backend_state["mesh"] = last_mesh
             mesh_path = save_mesh_to_glb(last_mesh, "final_scene")
             yield fig, pcd_path, mesh_path, mesh_path
+
+
+def refresh_map_overlays(esdf_show, esdf_height):
+    """Re-render the Real-Time Map from the persisted final map, toggling the ESDF
+    plane at the chosen height. Lets the user explore slices without re-running."""
+    pcd = backend_state.get("last_pcd")
+    if pcd is None:
+        fig = go.Figure()
+        fig.update_layout(title="Run a sequence first.", paper_bgcolor="#111111",
+                          font=dict(color="white"), margin=dict(l=0, r=0, b=0, t=30))
+        return fig
+    return create_plotly_figure_with_trajectory(
+        pcd, backend_state.get("last_traj"), backend_state.get("last_plane"),
+        backend_state.get("show_ground", False), bool(esdf_show), float(esdf_height))
 
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox") as demo:
     gr.Markdown("# 🌐 PRISM-VGGT: Alignment & Streaming Sandbox")
@@ -279,7 +297,8 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             camera_height_slider = gr.Slider(minimum=0.1, maximum=3.0, value=CONFIG_DEFAULTS["camera_height"], step=0.1, label="Target Camera Height (m)")
             face_size_slider = gr.Slider(minimum=256, maximum=1536, value=CONFIG_DEFAULTS["face_size"], step=64, label="Cubemap Face Resolution (px) [Higher = sharper geometry, ~no gain above input width]")
             mesh_extract_slider = gr.Slider(minimum=1, maximum=10, value=CONFIG_DEFAULTS["mesh_extract_every"], step=1, label="Rebuild Mesh Every N Submaps [Higher = faster, mesh refreshes less often]")
-            compute_esdf_checkbox = gr.Checkbox(value=False, label="Compute ESDF each batch (collision distance field; adds cost)")
+            compute_esdf_checkbox = gr.Checkbox(value=CONFIG_DEFAULTS["compute_esdf"], label="Compute ESDF each batch (collision distance field)")
+            world_frame_radio = gr.Radio(choices=["floor", "camera"], value=CONFIG_DEFAULTS["world_frame"], label="World origin (Z-up) [floor = Z=0 on floor; camera = first camera at 0,0,0]")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -307,13 +326,13 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
                     with gr.Tabs():
                         with gr.Tab("Real-Time Map"):
                             output_3d_seq = gr.Plot(label="Global Stitched Map")
+                            with gr.Row():
+                                show_esdf_checkbox = gr.Checkbox(value=False, label="Show ESDF plane")
+                                esdf_height_slider = gr.Slider(minimum=0.0, maximum=2.6, value=1.0, step=0.05, label="ESDF plane height (world Z above floor, m)")
                             download_seq = gr.File(label="💾 Download Global .ply")
                         with gr.Tab("Live Geometry (.glb)"):
                             output_mesh = gr.Model3D(label="Real-Time TSDF Mesh")
                             download_mesh = gr.File(label="💾 Download Mesh .glb")
-                        with gr.Tab("ESDF Slice"):
-                            esdf_height_slider = gr.Slider(minimum=0.0, maximum=2.6, value=1.0, step=0.05, label="Slice height (world Z above floor, m) - move to re-query after a run")
-                            output_esdf = gr.Plot(label="ESDF horizontal slice")
 
     def enforce_res(w, h, step, link, trig):
         step = max(1, int(step))
@@ -335,14 +354,15 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PRISM-VGGT Streaming Sandbox
             input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider,
             target_width, target_height, window_size_slider, overlap_slider,
             max_depth_slider, voxel_size_slider, camera_height_slider, face_size_slider, mesh_extract_slider,
-            compute_esdf_checkbox, live_stream_checkbox, show_ground_plane_checkbox
+            compute_esdf_checkbox, world_frame_radio, live_stream_checkbox, show_ground_plane_checkbox
         ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh]
     )
 
-    # ESDF slice is queried on demand from the persisted engine state, so the height
-    # slider can be explored after a run without recomputing the map.
-    esdf_height_slider.release(fn=create_esdf_figure, inputs=[esdf_height_slider], outputs=[output_esdf])
+    # The ESDF plane is overlaid on the Real-Time Map and queried on demand from the
+    # persisted map, so the toggle/height can be explored after a run without re-running.
+    show_esdf_checkbox.change(fn=refresh_map_overlays, inputs=[show_esdf_checkbox, esdf_height_slider], outputs=[output_3d_seq])
+    esdf_height_slider.release(fn=refresh_map_overlays, inputs=[show_esdf_checkbox, esdf_height_slider], outputs=[output_3d_seq])
 
 if __name__ == "__main__":
     # Entry point for the PRISM-VGGT streaming sandbox.

@@ -68,11 +68,17 @@ class StreamingWindowEngine:
         # built once at sequence end. Set False to restore the per-submap mesh.
         self.point_cloud_only = True
 
+        # --- World representation ---------------------------------------------
+        # Single knob for how the output map is framed. All options are Z-up,
+        # right-handed (ROS REP-103 / nvblox). It controls only where the origin sits:
+        #   "floor"  -> Z=0 on the detected floor (camera ends up at ~+camera height)
+        #   "camera" -> the first camera is the origin (0,0,0), as the legacy default
+        self.world_frame = "floor"
+
         # --- ESDF (Euclidean Signed Distance Field) ---------------------------
-        # Off by default. When True, the ESDF is recomputed each submap so callers
-        # can query collision distances (get_esdf_slice / tsdf.query_esdf) for
-        # planning. Adds a per-submap cost, so enable only if you need it.
-        self.compute_esdf = False
+        # When True, the ESDF is recomputed each submap so callers can query collision
+        # distances (get_esdf_slice / tsdf.query_esdf) for planning. Cheap in practice.
+        self.compute_esdf = True
         self.esdf_slice_resolution = 0.05  # meters between ESDF query samples
 
         # --- nvblox VRAM bounding ---------------------------------------------
@@ -741,13 +747,16 @@ class StreamingWindowEngine:
                 if not self.is_leveled and floor_plane is not None and floor_conf >= self.level_min_confidence:
                     n_canonical = canonical_native[mid_idx][:3, :3] @ floor_plane["normal"]
                     R_level = rotation_aligning_vectors(n_canonical, np.array([0.0, 0.0, 1.0]))
-                    c_can = (canonical_native[mid_idx] @ np.append(floor_plane["centroid"], 1.0))[:3]
-                    floor_z = float((R_level @ (s_anchor * c_can))[2])
                     self.world_align = np.eye(4)
                     self.world_align[:3, :3] = R_level
-                    self.world_align[2, 3] = -floor_z          # shift floor onto Z=0
+                    if self.world_frame == "floor":
+                        # Translate so the detected floor sits on Z=0.
+                        c_can = (canonical_native[mid_idx] @ np.append(floor_plane["centroid"], 1.0))[:3]
+                        floor_z = float((R_level @ (s_anchor * c_can))[2])
+                        self.world_align[2, 3] = -floor_z
                     self.is_leveled = True
-                    print(f"  > [Leveling] Z-up world, floor at Z=0 (conf={floor_conf:.2f}).")
+                    print(f"  > [Leveling] Z-up world ({self.world_frame} origin) "
+                          f"(conf={floor_conf:.2f}).")
 
                 R_anchor = self.world_align[:3, :3].copy()
                 t_anchor = self.world_align[:3, 3].copy()
@@ -964,7 +973,11 @@ class StreamingWindowEngine:
             torch.cuda.empty_cache()
 
             pt_alloc, pt_res, sys_used, sys_total = self.vram_tracker.stop()
-            nvblox_other = max(sys_used - pt_res, 0.0)
+            # nvblox lives outside PyTorch's allocator. Estimate it from the
+            # *instantaneous* system usage minus PyTorch's *current* reserved (NOT the
+            # peak pt_res, which can exceed live usage once perception frees back).
+            cur_res = torch.cuda.memory_reserved(0) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+            nvblox_other = max(sys_used - cur_res, 0.0)
             print("  --- ⏱️ Process Timing (Seconds) ---")
             for k, v in profiler.items():
                 print(f"    - {k:<20}: {v:.3f}s")
