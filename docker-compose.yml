@@ -1,0 +1,31 @@
+services:
+  ai-workspace:
+    image: nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
+    container_name: rafael_workspace
+    restart: unless-stopped
+    ports:
+      - "2222:22"
+      # Uncomment to reach the Gradio UI directly (or use SSH port-forwarding instead):
+      # - "7860:7860"
+    volumes:
+      - ./container_workspace:/root
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      # Silences the uv wheel naming error globally (nvblox ships a non-manylinux wheel).
+      - UV_SKIP_WHEEL_FILENAME_CHECK=1
+      # Recommended: use the apt-installed Python 3.12 instead of a uv-managed download.
+      # - UV_PYTHON_PREFERENCE=system
+    command: >
+      bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server git curl libgl1 libglib2.0-0 python3.12 python3.12-venv python3-pip ninja-build
+      && mkdir -p /var/run/sshd
+      && echo 'root:lab_password' | chpasswd
+      && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+      && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      && /usr/sbin/sshd -D"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

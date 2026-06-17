@@ -10,9 +10,12 @@ Built for robotics, VR streaming, and spatial computing, PRISM-VGGT adapts slidi
 Originally starting as a spinoff of [LASER](https://github.com/neu-vi/LASER), we completely redesigned the architecture to integrate concepts from [VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM). Using [PanoVGGT](https://github.com/YijingGuo-June/PanoVGGT) as our geometry engine, PRISM-VGGT processes frames in sliding-window batches to address monocular scale drift, utilizing NVIDIA's `nvblox` to fuse multi-view geometry into a globally consistent, dense TSDF mesh.
 
 ## Requirements
-* **OS:** Linux (Ubuntu 22.04 / Debian)
-* **GPU:** NVIDIA GPU with CUDA 12.4 support
-* **Python:** 3.11
+* **OS:** Linux (Ubuntu 24.04 / Debian)
+* **GPU:** NVIDIA GPU with CUDA 12.8 support (compute capability >= 7.5). Tested on Blackwell (RTX PRO 6000, sm_120/sm_122).
+* **CUDA:** 12.8 (the container image `nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04` is known-good)
+* **Python:** 3.12
+
+> **Why CUDA 12.8?** Blackwell GPUs (RTX 50-series, RTX PRO 6000) need `sm_120`/`sm_122` kernels, which first ship in PyTorch's `cu128` build (`torch==2.8`). Older `cu124` wheels fail with *"no kernel image is available for execution on the device"*.
 
 ## Quick Install (RunPod / Ubuntu)
 
@@ -22,8 +25,27 @@ Because this project relies on a submodule, ensure you clone recursively. Then, 
 git clone --recurse-submodules https://github.com/zRafaF/PRISM-VGGT
 cd PRISM-VGGT
 chmod +x setup.sh
+chmod +x scripts/build_nvblox.sh
 ./setup.sh
 ```
+
+> Setting up the reference Docker container (CUDA 12.8 / Ubuntu 24.04) and connecting over
+> SSH? See **[`docs/SERVER_SETUP.md`](docs/SERVER_SETUP.md)**.
+
+### Choosing how `nvblox` is installed
+
+`setup.sh` offers three ways to install `nvblox_torch`. Pick one with a CLI argument, the
+`NVBLOX_MODE` env var, or the interactive menu (defaults to `prebuilt` after a 60s timeout):
+
+| Mode | Command | When to use |
+| --- | --- | --- |
+| `prebuilt` *(default)* | `./setup.sh` | Standard hardware. Fastest. **Segfaults on Blackwell + cu128** (ABI mismatch). |
+| `source` | `./setup.sh source` | **Blackwell / RTX PRO 6000.** Builds nvblox matched to your GPU arch, CUDA, and torch ABI. |
+| `url` | `./setup.sh url` | Install a specific wheel (prompts, or set `NVBLOX_WHEEL_URL`). |
+
+It runs unattended too, e.g. `NVBLOX_MODE=source ./setup.sh`. See
+[`docs/ADVANCED_NVBLOX.md`](docs/ADVANCED_NVBLOX.md) for the source-build details and
+troubleshooting.
 
 ### Manual Installation Steps
 
@@ -48,7 +70,9 @@ uv run python -c "from prism_vggt import download_weights; download_weights('che
 
 ### Handling Custom Environments (Different OS / CUDA versions)
 
-By default, `uv sync` installs an `nvblox-torch` wheel pre-compiled for **Ubuntu 22.04 and CUDA 12.4**.
+By default, `uv sync` installs the official `nvblox-torch` wheel pre-compiled for **Ubuntu 24.04 and CUDA 12.8** (`nvblox_torch-0.0.10+cu12ubuntu24-...`).
+
+> **`uv` note:** that wheel uses a non-manylinux filename, so `uv` will reject it unless you set `UV_SKIP_WHEEL_FILENAME_CHECK=1` in the environment (already exported by `setup.sh` and in the container's `docker-compose`). Without it, `uv sync` fails with a wheel-filename validation error.
 
 If you are on a different operating system or require a different CUDA version, you do not need to manually edit configuration files. You can dynamically swap the wheel by running the `uv add` command with the URL of the wheel you need.
 
@@ -58,7 +82,19 @@ For example, to swap to a different wheel URL, run:
 uv add "nvblox-torch @ <YOUR_CUSTOM_WHEEL_URL>"
 ```
 
-This will automatically update the project configuration and install the correct wheel. *If you need to build `nvblox` from source, please see `docs/ADVANCED_NVBLOX.md` and the [official nvblox documentation](https://nvidia-isaac.github.io/nvblox/public/pages/installation.html).*
+This will automatically update the project configuration and install the correct wheel.
+
+> **Blackwell GPUs (RTX PRO 6000 / `sm_120`) and torch 2.8 + cu128:** the prebuilt nvblox
+> wheels **segfault at `import nvblox_torch`** due to a C++ ABI mismatch. Build from source
+> instead — with the venv active, run:
+>
+> ```bash
+> ./scripts/build_nvblox.sh
+> ```
+>
+> It matches your GPU arch, CUDA version, and torch ABI automatically. See
+> `docs/ADVANCED_NVBLOX.md` (and its Troubleshooting table) for details and the
+> [official nvblox documentation](https://nvidia-isaac.github.io/nvblox/public/pages/installation.html).
 
 ## Usage
 
