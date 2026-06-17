@@ -3,7 +3,6 @@ name = "prism-vggt"
 version = "0.1.0"
 description = "Training-Free Streaming 3D Reconstruction from Panoramic Video using PanoVGGT and Nvblox"
 readme = "README.md"
-# Bumped to 3.12 to satisfy xformers and modern PyTorch requirements
 requires-python = "==3.12.*"
 
 # --- CORE LIBRARY DEPENDENCIES ---
@@ -11,7 +10,7 @@ dependencies = [
     "torch==2.8.*",
     "torchvision>=0.23.0",
     "torchaudio>=2.8.0",
-    "xformers>=0.0.28",
+    # xformers removed: relying on PyTorch Native SDPA / FlashAttention
     # Math & Arrays
     "numpy==1.26.4",
     "scipy",
@@ -34,7 +33,6 @@ dependencies = [
     "tqdm",
     "cython",
     "numba",
-    # Pointed to the official NVIDIA Isaac Ubuntu 24.04 wheel
     "nvblox-torch @ https://github.com/nvidia-isaac/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10+cu12ubuntu24-py3-none-linux_x86_64.whl ; sys_platform == 'linux'",
 ]
 
@@ -72,10 +70,8 @@ explicit = true
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
-xformers = { index = "pytorch-cu128" }
 
 [tool.uv.extra-build-dependencies]
-xformers = ["torch>=2.8.0"]
 prism-vggt = ["Cython", "numpy"]
 
 [tool.setuptools.packages.find]
