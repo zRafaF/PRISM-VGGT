@@ -3,15 +3,15 @@ name = "prism-vggt"
 version = "0.1.0"
 description = "Training-Free Streaming 3D Reconstruction from Panoramic Video using PanoVGGT and Nvblox"
 readme = "README.md"
-requires-python = "==3.11.*"
+# Bumped to 3.12 to satisfy xformers and modern PyTorch requirements
+requires-python = "==3.12.*"
 
 # --- CORE LIBRARY DEPENDENCIES ---
 dependencies = [
-    # Bumped to 2.8 series
     "torch==2.8.*",
     "torchvision>=0.23.0",
     "torchaudio>=2.8.0",
-    "xformers>=0.0.28", # Ensure xformers is also bumped to match torch 2.8
+    "xformers>=0.0.28",
     # Math & Arrays
     "numpy==1.26.4",
     "scipy",
@@ -34,7 +34,8 @@ dependencies = [
     "tqdm",
     "cython",
     "numba",
-    "nvblox-torch @ https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu22-py3-none-linux_x86_64.whl ; sys_platform == 'linux'",
+    # Pointed to the official NVIDIA Isaac Ubuntu 24.04 wheel
+    "nvblox-torch @ https://github.com/nvidia-isaac/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10+cu12ubuntu24-py3-none-linux_x86_64.whl ; sys_platform == 'linux'",
 ]
 
 # --- OPTIONAL EXTENSIONS ---
@@ -73,7 +74,6 @@ torchvision = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
 xformers = { index = "pytorch-cu128" }
 
-# Inject PyTorch into the isolated build environment to prevent source-compilation crashes
 [tool.uv.extra-build-dependencies]
 xformers = ["torch>=2.8.0"]
 prism-vggt = ["Cython", "numpy"]
