@@ -63,7 +63,19 @@ For example, to swap to a different wheel URL, run:
 uv add "nvblox-torch @ <YOUR_CUSTOM_WHEEL_URL>"
 ```
 
-This will automatically update the project configuration and install the correct wheel. *If you need to build `nvblox` from source, please see `docs/ADVANCED_NVBLOX.md` and the [official nvblox documentation](https://nvidia-isaac.github.io/nvblox/public/pages/installation.html).*
+This will automatically update the project configuration and install the correct wheel.
+
+> **Blackwell GPUs (RTX PRO 6000 / `sm_120`) and torch 2.8 + cu128:** the prebuilt nvblox
+> wheels **segfault at `import nvblox_torch`** due to a C++ ABI mismatch. Build from source
+> instead — with the venv active, run:
+>
+> ```bash
+> ./scripts/build_nvblox.sh
+> ```
+>
+> It matches your GPU arch, CUDA version, and torch ABI automatically. See
+> `docs/ADVANCED_NVBLOX.md` (and its Troubleshooting table) for details and the
+> [official nvblox documentation](https://nvidia-isaac.github.io/nvblox/public/pages/installation.html).
 
 ## Usage
 
