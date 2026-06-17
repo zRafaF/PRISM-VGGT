@@ -40,7 +40,7 @@ Once the C++ core is compiled, navigate to the PyTorch bindings folder to packag
 cd ../nvblox_torch
 
 # Create the wheel, pretending a specific version tag to avoid local version metadata issues
-SETUPTOOLS_SCM_PRETEND_VERSION="0.0.10+cu124ubuntu22" uv build --wheel --no-config \
+SETUPTOOLS_SCM_PRETEND_VERSION="0.0.10+cu128ubuntu24" uv build --wheel --no-config \
   --config-setting="--build-option=--plat-name" \
   --config-setting="--build-option=linux_x86_64"
 ```
@@ -48,5 +48,7 @@ SETUPTOOLS_SCM_PRETEND_VERSION="0.0.10+cu124ubuntu22" uv build --wheel --no-conf
 The resulting `.whl` file will be generated in `nvblox_torch/dist/`. You can upload this to GitHub Releases and install it via `uv pip install <URL>`, or install it locally:
 
 ```bash
-uv pip install dist/nvblox_torch-0.0.10+cu124ubuntu22-py3-none-linux_x86_64.whl
+uv pip install dist/nvblox_torch-0.0.10+cu128ubuntu24-py3-none-linux_x86_64.whl
 ```
+
+> **Tip (Blackwell / RTX PRO 6000):** A from-source build compiles `nvblox` only for the **local** GPU's compute capability, so it always matches your card. This is the most reliable fix if the pre-built wheel ever errors at runtime with *"no kernel image is available for execution on the device"* on `sm_120`/`sm_122`.
