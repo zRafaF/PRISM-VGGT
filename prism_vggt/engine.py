@@ -51,7 +51,7 @@ class StreamingWindowEngine:
         self.color_point_chunk = 500_000
         # Coarse grid (multiples of voxel_size) used for the incremental color
         # cache: one cached color per block, propagated to all dense vertices in it.
-        self.color_block_mult = 2.5
+        self.color_block_mult = 1.0
 
         # Dump nvblox's internal C++ stage timers every N submaps (0 = off). These
         # give the library's own per-stage breakdown (integration, meshing, ...).
