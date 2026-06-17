@@ -118,7 +118,7 @@ if [ "$NVBLOX_MODE" = "source" ]; then
     # Run the builder inside the project venv so it compiles against the right torch.
     # build_nvblox.sh auto-detects GPU arch, CUDA version, and C++ ABI.
     source "$REPO_ROOT/.venv/bin/activate"
-    "$REPO_ROOT/scripts/build_nvblox.sh"
+    bash "$REPO_ROOT/scripts/build_nvblox.sh"
 fi
 
 # 7. Download weights
