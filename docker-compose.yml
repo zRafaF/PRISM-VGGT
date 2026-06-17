@@ -17,7 +17,7 @@ services:
       # - UV_PYTHON_PREFERENCE=system
     command: >
       bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server git curl libgl1 libglib2.0-0 python3.12 python3.12-venv python3-pip ninja-build
-      && mkdir /var/run/sshd
+      && mkdir -p /var/run/sshd
       && echo 'root:lab_password' | chpasswd
       && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
       && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config

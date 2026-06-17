@@ -25,7 +25,7 @@ services:
       - UV_SKIP_WHEEL_FILENAME_CHECK=1
     command: >
       bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server git curl libgl1 libglib2.0-0 python3.12 python3.12-venv python3-pip ninja-build
-      && mkdir /var/run/sshd
+      && mkdir -p /var/run/sshd
       && echo 'root:lab_password' | chpasswd
       && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
       && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
@@ -128,3 +128,16 @@ again), or by forwarding it over SSH:
 ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -L 7860:localhost:7860 root@localhost -p 2222
 # then open http://localhost:7860 in your browser
 ```
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Container crash-loops: `mkdir: cannot create directory '/var/run/sshd': File exists` then `exited with code 1 (restarting)` | `mkdir /var/run/sshd` fails on the **second** start (the dir already exists), and the `&&` chain makes that non-zero exit kill the container | Use `mkdir -p /var/run/sshd` (already fixed in `docker-compose.yml`). Apply with `docker compose down && docker compose up -d`. |
+| SSH: `REMOTE HOST IDENTIFICATION HAS CHANGED` | The container regenerated its host key after a recreate | Connect with `-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no` (as shown above). |
+| `nvcc: command not found` during a source build | CUDA toolkit not on `PATH` | `export PATH=/usr/local/cuda/bin:$PATH` (see `docs/ADVANCED_NVBLOX.md`). |
+| `import nvblox_torch` segfaults | Prebuilt wheel's ABI ≠ torch's | Reinstall with `./setup.sh source` (see `docs/ADVANCED_NVBLOX.md`). |
+
+> After editing `docker-compose.yml`, always run `docker compose up -d` (add `--force-recreate`
+> if the container is mid-crash-loop) so the new `command` takes effect — a plain restart reuses
+> the old definition.
