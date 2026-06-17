@@ -21,7 +21,7 @@ cd "$REPO_ROOT"
 #   url       -> a specific wheel URL (set NVBLOX_WHEEL_URL or you will be asked)
 NVBLOX_MODE="${1:-${NVBLOX_MODE:-}}"
 NVBLOX_WHEEL_URL="${NVBLOX_WHEEL_URL:-}"
-DEFAULT_NVBLOX_URL="https://github.com/nvidia-isaac/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10+cu12ubuntu24-py3-none-linux_x86_64.whl"
+DEFAULT_NVBLOX_URL="https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu24-py3-none-linux_x86_64.whl"
 
 choose_nvblox_mode() {
     [ -n "$NVBLOX_MODE" ] && return            # already chosen via arg/env
