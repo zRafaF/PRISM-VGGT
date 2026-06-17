@@ -15,12 +15,17 @@ and ``download_weights`` stay cheap and dependency-light.
 """
 from .weights import download_weights, PANOVGGT_WEIGHTS_URL, DEFAULT_WEIGHTS_PATH
 from .perception_base import BasePerceptionExtractor
+from .frames import FrameInput, WorldFrame, ProcessingMode, Timestamp
 
 __all__ = [
     "download_weights",
     "PANOVGGT_WEIGHTS_URL",
     "DEFAULT_WEIGHTS_PATH",
     "BasePerceptionExtractor",
+    "FrameInput",
+    "WorldFrame",
+    "ProcessingMode",
+    "Timestamp",
     "StreamingWindowEngine",
     "PanoVGGTBackend",
 ]

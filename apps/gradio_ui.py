@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import tempfile
 from PIL import Image
 
+from prism_vggt import FrameInput
 from prism_vggt.backends.panovggt import PanoVGGTBackend
 from prism_vggt.engine import StreamingWindowEngine
 from prism_vggt.utils.masking import get_spherical_valid_mask
@@ -42,7 +43,6 @@ streaming_engine = StreamingWindowEngine(
     perception=perception,
     voxel_size=CONFIG_DEFAULTS["voxel_size"],
     max_depth=CONFIG_DEFAULTS["max_depth"],
-    target_camera_height=CONFIG_DEFAULTS["camera_height"],
     face_size=CONFIG_DEFAULTS["face_size"],
 )
 
@@ -206,24 +206,26 @@ def process_sequence_ui(
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2: raise gr.Error("Please provide at least 2 valid images.")
 
-    frames, masks = [], []
-    for path in file_paths:
+    # Build FrameInputs (image, mask, per-frame camera height, timestamp/id). The UI
+    # uses a single height for all frames and the file index as the timestamp.
+    frame_inputs = []
+    for idx, path in enumerate(file_paths):
         img_np = np.array(Image.open(path).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS))
-        frames.append(img_np)
-        masks.append(get_spherical_valid_mask(img_np.shape[0], img_np.shape[1], zenith_deg=zenith_limit, nadir_deg=nadir_limit))
+        mask = get_spherical_valid_mask(img_np.shape[0], img_np.shape[1], zenith_deg=zenith_limit, nadir_deg=nadir_limit)
+        frame_inputs.append(FrameInput(image=img_np, mask=mask, camera_height=float(camera_height), timestamp=idx))
 
-    backend_state["frames"] = frames
+    backend_state["frames"] = [f.image for f in frame_inputs]
 
     streaming_engine.max_depth = float(max_depth)
     streaming_engine.voxel_size = float(voxel_size)
-    streaming_engine.target_camera_height = float(camera_height)
     streaming_engine.face_size = int(face_size)
     streaming_engine.mesh_extract_every = int(mesh_extract_every)
-    streaming_engine.compute_esdf = bool(compute_esdf)
     streaming_engine.world_frame = str(world_frame)
 
     last_mesh, last_pcd, last_traj, last_plane = None, None, None, None
-    generator = streaming_engine.process_sequence(frames=frames, masks=masks, window_size=int(window_size), overlap=int(overlap))
+    generator = streaming_engine.process_sequence(
+        frame_inputs, window_size=int(window_size), overlap=int(overlap),
+        generate_esdf=bool(compute_esdf))
 
     for mesh, global_pcd, trajectory, plane in generator:
         last_mesh, last_pcd, last_traj, last_plane = mesh, global_pcd, trajectory, plane

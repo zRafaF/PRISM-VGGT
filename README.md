@@ -76,17 +76,25 @@ The public API is two objects: a perception backend (any `BasePerceptionExtracto
 and the `StreamingWindowEngine` that fuses it into a dense map.
 
 ```python
-from prism_vggt import PanoVGGTBackend, StreamingWindowEngine, download_weights
+from prism_vggt import PanoVGGTBackend, StreamingWindowEngine, FrameInput, download_weights
 
 download_weights("checkpoints/model.pt")            # explicit, one-time
 perception = PanoVGGTBackend(weights_path="checkpoints/model.pt")
 engine = StreamingWindowEngine(perception, voxel_size=0.02, max_depth=4.5)
+engine.processing_mode = "parallel"   # or "sequential" (lower peak VRAM)
+
+# Each input frame carries its image, validity mask, an instantaneous camera-height
+# measurement, and a timestamp/id (attached to the output pose for downstream SLAM).
+frames = [FrameInput(image=img, mask=msk, camera_height=h, timestamp=t)
+          for img, msk, h, t in my_capture]
 
 for mesh, pointcloud, trajectory, floor in engine.process_sequence(
-    frames=my_rgb_list, masks=my_mask_list, window_size=16, overlap=4
+    frames, window_size=16, overlap=4, generate_esdf=True
 ):
     # `pointcloud` is the dense local-viz cloud for this submap.
     print(f"Submap {engine.submap_count}: map version {engine.get_map_version()}")
+
+timestamps, poses = engine.get_poses()   # (N,), (N,4,4) -- timestamped camera poses
 ```
 
 #### Streaming the point cloud to a client (deltas + snapshot)
@@ -126,6 +134,6 @@ The world frame is **Z-up, right-handed** (ROS REP-103 / nvblox): the floor is a
 Perception inference (GPU) and mapping (TSDF + mesh + color) run concurrently as a
 one-deep **A/B double buffer**: while window *k* is being mapped, window *k+1* is
 already being inferred. Windows are consumed strictly in order and none is skipped.
-Set `engine.pipeline_inference = False` to run them sequentially. Other knobs:
+Set `engine.processing_mode = "sequential"` to run them one after another. Other knobs:
 `engine.point_cloud_only` (skip the per-submap triangle mesh), `engine.mesh_extract_every`
 (amortize mesh rebuilds), and `engine.face_size` (cubemap resolution).
