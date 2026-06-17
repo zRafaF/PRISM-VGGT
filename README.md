@@ -25,6 +25,7 @@ Because this project relies on a submodule, ensure you clone recursively. Then, 
 git clone --recurse-submodules https://github.com/zRafaF/PRISM-VGGT
 cd PRISM-VGGT
 chmod +x setup.sh
+chmod +x scripts/build_nvblox.sh
 ./setup.sh
 ```
 
