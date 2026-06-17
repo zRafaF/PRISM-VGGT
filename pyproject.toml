@@ -33,7 +33,7 @@ dependencies = [
     "tqdm",
     "cython",
     "numba",
-    "nvblox-torch @ https://github.com/nvidia-isaac/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10+cu12ubuntu24-py3-none-linux_x86_64.whl ; sys_platform == 'linux'",
+    "nvblox-torch @ https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu24-py3-none-linux_x86_64.whl ; sys_platform == 'linux'",
 ]
 
 # --- OPTIONAL EXTENSIONS ---
