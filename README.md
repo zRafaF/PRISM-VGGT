@@ -28,6 +28,24 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
+> Setting up the reference Docker container (CUDA 12.8 / Ubuntu 24.04) and connecting over
+> SSH? See **[`docs/SERVER_SETUP.md`](docs/SERVER_SETUP.md)**.
+
+### Choosing how `nvblox` is installed
+
+`setup.sh` offers three ways to install `nvblox_torch`. Pick one with a CLI argument, the
+`NVBLOX_MODE` env var, or the interactive menu (defaults to `prebuilt` after a 60s timeout):
+
+| Mode | Command | When to use |
+| --- | --- | --- |
+| `prebuilt` *(default)* | `./setup.sh` | Standard hardware. Fastest. **Segfaults on Blackwell + cu128** (ABI mismatch). |
+| `source` | `./setup.sh source` | **Blackwell / RTX PRO 6000.** Builds nvblox matched to your GPU arch, CUDA, and torch ABI. |
+| `url` | `./setup.sh url` | Install a specific wheel (prompts, or set `NVBLOX_WHEEL_URL`). |
+
+It runs unattended too, e.g. `NVBLOX_MODE=source ./setup.sh`. See
+[`docs/ADVANCED_NVBLOX.md`](docs/ADVANCED_NVBLOX.md) for the source-build details and
+troubleshooting.
+
 ### Manual Installation Steps
 
 If you prefer to install manually:
