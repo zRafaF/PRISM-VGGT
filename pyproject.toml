@@ -7,10 +7,11 @@ requires-python = "==3.11.*"
 
 # --- CORE LIBRARY DEPENDENCIES ---
 dependencies = [
-    "torch==2.4.*",
-    "torchvision>=0.19.0",
-    "torchaudio>=2.4.0",
-    "xformers>=0.0.27.post2",
+    # Bumped to 2.8 series
+    "torch==2.8.*",
+    "torchvision>=0.23.0",
+    "torchaudio>=2.8.0",
+    "xformers>=0.0.28", # Ensure xformers is also bumped to match torch 2.8
     # Math & Arrays
     "numpy==1.26.4",
     "scipy",
@@ -60,21 +61,21 @@ benchmarks = [
 requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-# --- UV SPECIFIC CONFIGURATION (CUDA 12.4 HARD-LOCK) ---
+# --- UV SPECIFIC CONFIGURATION (CUDA 12.8 HARD-LOCK) ---
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
-torchaudio = { index = "pytorch-cu124" }
-xformers = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+xformers = { index = "pytorch-cu128" }
 
 # Inject PyTorch into the isolated build environment to prevent source-compilation crashes
 [tool.uv.extra-build-dependencies]
-xformers = ["torch>=2.4.0"]
+xformers = ["torch>=2.8.0"]
 prism-vggt = ["Cython", "numpy"]
 
 [tool.setuptools.packages.find]
