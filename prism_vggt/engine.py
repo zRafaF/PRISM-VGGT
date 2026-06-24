@@ -156,6 +156,7 @@ class StreamingWindowEngine:
         self.full_poses = []
         self.pose_timestamps = []      # parallel to full_poses (from FrameInput.timestamp)
         self.processed_indices = []
+        self._done_starts = set()      # window-start indices already processed (online mode)
 
         # Block color cache + best-view colorizer + streaming API (see coloring.py).
         # Rebuilt here so per-run config (voxel_size, max_depth, ...) is picked up.
@@ -362,7 +363,8 @@ class StreamingWindowEngine:
         return display_mesh, display_pcd
 
     def process_sequence(self, frames: List[FrameInput], window_size: int = 16,
-                         overlap: int = 4, generate_esdf: Optional[bool] = None
+                         overlap: int = 4, generate_esdf: Optional[bool] = None,
+                         reset: bool = True, finalize: bool = True
                          ) -> Iterator[Tuple[Any, Any, np.ndarray, Optional[dict]]]:
         """Stream a sequence in overlapping windows, yielding one update per submap.
 
@@ -397,7 +399,13 @@ class StreamingWindowEngine:
         """
         self.window_size = window_size
         self.overlap = overlap
-        self.reset()
+        # reset=True (default): offline/batch — wipe the map and process everything.
+        # reset=False: online/streaming — KEEP the accumulated map and process only
+        # windows not yet seen, so repeated calls on a growing frame list extend one
+        # persistent map (the nvblox TSDF, colorizer, poses and overlap-chain all
+        # carry over because we don't reset them).
+        if reset:
+            self.reset()
         if generate_esdf is not None:
             self.compute_esdf = bool(generate_esdf)
         parallel = (self.processing_mode == "parallel")
@@ -405,7 +413,8 @@ class StreamingWindowEngine:
         num_frames = len(frames)
         t_seq_start = time.time()
 
-        starts = list(range(0, num_frames - self.window_size + 1, self.window_size - self.overlap))
+        all_starts = range(0, num_frames - self.window_size + 1, self.window_size - self.overlap)
+        starts = [i for i in all_starts if i not in self._done_starts]   # only NEW windows
 
         # Prime the pipeline: launch the first window's inference in the background so
         # it is ready (or nearly) by the time the loop body asks for it.
@@ -760,11 +769,15 @@ class StreamingWindowEngine:
                           f"{free_now:.1f} GB free - risk of a transient-spike OOM. "
                           f"Lower max_depth/voxel or set processing_mode='sequential'.")
             self.submap_count += 1
+            self._done_starts.add(i)
 
             yield display_mesh, display_pcd, np.array(self.trajectory), self.last_floor_plane
 
         if self.tsdf_future is not None:
             self.tsdf_future.result()
+
+        if not finalize:
+            return    # online/streaming caller emits per-submap output itself
 
         print("\n==========================================")
         print(f"[Engine] Sequence Complete ({(time.time() - t_seq_start):.2f}s). Extracting Unified Global Point Cloud...")
