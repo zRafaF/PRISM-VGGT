@@ -533,21 +533,37 @@ class StreamingWindowEngine:
                     # Degenerate baseline (camera barely moved across the overlap):
                     # keep the previous metric scale rather than inventing one.
                     s_est = self.current_metric_scale
-                # Metric scale is anchored ONCE on the first window (from the floor /
-                # camera height); afterwards it propagates purely through the overlap-
-                # camera Sim3 chain. Re-pulling each window toward that window's floor
-                # scale gave every submap a slightly different scale whenever the
-                # per-frame camera height wasn't perfectly consistent → the map
-                # misaligned. Opt back into the old drift-curbing pull with
-                # SCALE_TRACK_FLOOR=1 (only safe if the stamped height is rock-steady).
-                if (os.environ.get("SCALE_TRACK_FLOOR", "0") == "1"
-                        and floor_scale is not None and floor_conf > 0.4):
-                    s_est = 0.9 * s_est + 0.1 * floor_scale
-                s_anchor = float(np.clip(s_est, 0.1, 5.0))
-                # Keep translation consistent with the final (blended/clipped) scale.
+                if os.environ.get("LOCK_SCALE_AFTER_FIRST", "1") == "1":
+                    # Anchor metric scale ONCE on the first window; every later window
+                    # REUSES it and estimates only rotation+translation from the
+                    # overlap (the Umeyama rotation is scale-independent). Leaving the
+                    # overlap Sim3 free re-estimates scale each submap; even a ~1%
+                    # drift compounds → the map inflates and submaps no longer fuse in
+                    # the TSDF (ghosting/cloning + unbounded point growth). Set
+                    # LOCK_SCALE_AFTER_FIRST=0 to restore the free-Sim3 behaviour.
+                    s_anchor = self.current_metric_scale
+                else:
+                    if (os.environ.get("SCALE_TRACK_FLOOR", "0") == "1"
+                            and floor_scale is not None and floor_conf > 0.4):
+                        s_est = 0.9 * s_est + 0.1 * floor_scale
+                    s_anchor = float(np.clip(s_est, 0.1, 5.0))
+                # Keep translation consistent with the (locked or estimated) scale.
                 t_anchor = tgt_ctr - s_anchor * (R_anchor @ src_ctr)
 
             self.current_metric_scale = s_anchor
+
+            # ── per-submap anchor diagnostics ───────────────────────────────
+            # Watch these across submaps to localise the online "cloning" drift:
+            #   s ~1.000 stable  → scale is fine;  s creeping → scale drift.
+            #   t_z / cam0_z creeping monotonically → vertical placement drift
+            #   (matches a floor that climbs 0/10/20 cm per submap).
+            #   floor_conf low/variable → unreliable floor → bad first anchor.
+            if not self.is_first_window:
+                _cam0z = float((s_anchor * (R_anchor @ canonical_native[0][:3, 3])
+                                + t_anchor)[2])
+                print(f"  > [Anchor] submap {self.submap_count}: s={s_anchor:.4f}  "
+                      f"t_z={float(t_anchor[2]):+.3f}  cam0_z={_cam0z:+.3f}  "
+                      f"floor_conf={floor_conf:.2f}")
 
             def _to_world(cn):
                 gp = np.eye(4)
