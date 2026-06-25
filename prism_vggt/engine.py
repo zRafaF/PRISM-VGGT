@@ -573,6 +573,34 @@ class StreamingWindowEngine:
 
             global_poses = [_to_world(cn) for cn in canonical_native]
 
+            # ── Overlap pose pinning (online drift fix) ────────────────────────
+            # In online mode (reset=False), each window's VGGT inference produces
+            # slightly different predictions for the shared overlap frames. The
+            # Sim3 registration absorbs this as a small translation residual that
+            # accumulates monotonically across submaps (the "floor cloning" bug).
+            # Fix: pin the overlap frames' global poses to EXACTLY the values
+            # computed by the previous window. The Sim3 transform still guides
+            # the new (non-overlap) frames correctly; only the anchors are locked.
+            if not self.is_first_window and len(self.prev_overlap_global_poses) == self.overlap:
+                # Diagnostic: measure the residual the Sim3 left on the overlap
+                # frames before we pin them (should shrink to ~0 with a good fit).
+                overlap_residuals = []
+                for oi in range(self.overlap):
+                    sim3_pos = global_poses[oi][:3, 3]
+                    prev_pos = self.prev_overlap_global_poses[oi][:3, 3]
+                    overlap_residuals.append(sim3_pos - prev_pos)
+                resid_arr = np.array(overlap_residuals)
+                mean_resid = resid_arr.mean(axis=0)
+                max_resid = np.abs(resid_arr).max(axis=0)
+                print(f"  > [Overlap Pin] mean residual xyz={mean_resid[0]:+.4f}, "
+                      f"{mean_resid[1]:+.4f}, {mean_resid[2]:+.4f}  "
+                      f"max |residual| xyz={max_resid[0]:.4f}, "
+                      f"{max_resid[1]:.4f}, {max_resid[2]:.4f}")
+
+                # Pin: overwrite overlap poses with the exact previous-window values
+                for oi in range(self.overlap):
+                    global_poses[oi] = self.prev_overlap_global_poses[oi].copy()
+
             # Record the detected floor plane in (leveled) world coordinates so the UI
             # can render the exact plane that was found this submap.
             if floor_plane is not None and floor_conf >= self.level_min_confidence:
@@ -623,6 +651,11 @@ class StreamingWindowEngine:
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
                         self.prev_overlap_global_poses = []
+                    # Save the Sim3-computed (NOT pinned) global pose for the tail
+                    # overlap frames. These are computed from _to_world() on the
+                    # new (non-overlap) part of the window, so they carry the
+                    # current window's honest transform. The NEXT window will pin
+                    # its head to these exact values, preventing drift accumulation.
                     self.prev_overlap_global_poses.append(global_pose)
             
             self.prev_overlap_raw_pts = pts_list[-self.overlap:]
