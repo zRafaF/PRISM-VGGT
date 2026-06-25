@@ -1,4 +1,5 @@
 import gc
+import os
 import time
 import hashlib
 from typing import Optional, List, Tuple, Dict, Iterator, Any
@@ -532,8 +533,15 @@ class StreamingWindowEngine:
                     # Degenerate baseline (camera barely moved across the overlap):
                     # keep the previous metric scale rather than inventing one.
                     s_est = self.current_metric_scale
-                # Light absolute pull toward the floor scale to curb slow drift.
-                if floor_scale is not None and floor_conf > 0.4:
+                # Metric scale is anchored ONCE on the first window (from the floor /
+                # camera height); afterwards it propagates purely through the overlap-
+                # camera Sim3 chain. Re-pulling each window toward that window's floor
+                # scale gave every submap a slightly different scale whenever the
+                # per-frame camera height wasn't perfectly consistent → the map
+                # misaligned. Opt back into the old drift-curbing pull with
+                # SCALE_TRACK_FLOOR=1 (only safe if the stamped height is rock-steady).
+                if (os.environ.get("SCALE_TRACK_FLOOR", "0") == "1"
+                        and floor_scale is not None and floor_conf > 0.4):
                     s_est = 0.9 * s_est + 0.1 * floor_scale
                 s_anchor = float(np.clip(s_est, 0.1, 5.0))
                 # Keep translation consistent with the final (blended/clipped) scale.
