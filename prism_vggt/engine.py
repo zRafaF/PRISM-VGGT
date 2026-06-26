@@ -615,9 +615,34 @@ class StreamingWindowEngine:
                     "extent": float(max(extent_metric, 0.5)),
                 }
 
+            # ── Depth-integration scale (floor staircase fix) ──────────────────
+            # THE POSE CHAIN scale is locked to the first window for trajectory
+            # stability (LOCK_SCALE_AFTER_FIRST), but VGGT's *native per-window*
+            # scale slowly drifts as the camera explores new scenery. Integrating
+            # depth at the frozen first-window scale then lands each later window's
+            # FLOOR at the wrong height → the floor "climbs" 0/10/20cm per submap
+            # (the duplicated/layered ground). Fix: integrate THIS window's depth at
+            # THIS window's own floor-derived metric scale (which by construction
+            # puts the detected floor at the metric camera height), while leaving
+            # the pose chain on the locked scale. The camera barely moves within a
+            # window, so this only changes local point *sizing* slightly while
+            # keeping every window's floor at Z=0 — no staircase. Falls back to the
+            # locked scale when this window has no confident floor. Disable with
+            # DEPTH_SCALE_FROM_FLOOR=0 to restore the single-locked-scale behaviour.
+            depth_scale = self.current_metric_scale
+            if (os.environ.get("DEPTH_SCALE_FROM_FLOOR", "1") == "1"
+                    and not self.is_first_window
+                    and floor_scale is not None
+                    and floor_conf >= self.level_min_confidence):
+                depth_scale = float(floor_scale)
+                if abs(depth_scale - self.current_metric_scale) > 1e-6:
+                    print(f"  > [Depth Scale] floor-anchored s={depth_scale:.4f} "
+                          f"(pose-chain locked s={self.current_metric_scale:.4f}, "
+                          f"Δ={100*(depth_scale/self.current_metric_scale - 1):+.2f}%)")
+
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             start_idx = 0 if self.is_first_window else self.overlap
-            
+
             for j in range(self.window_size):
                 global_pose = global_poses[j]
 
@@ -640,7 +665,7 @@ class StreamingWindowEngine:
                     if tsdf_pose[2, 1] > 0:
                         tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
 
-                    scaled_pts = pts_list[j] * self.current_metric_scale
+                    scaled_pts = pts_list[j] * depth_scale
                     depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
 
                     batch_depths.append(depth_map)
