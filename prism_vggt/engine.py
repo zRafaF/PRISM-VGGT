@@ -174,6 +174,23 @@ class StreamingWindowEngine:
         self.is_first_window = True
         self.current_metric_scale = 1.0
 
+        # --- Robust initial metric-scale anchoring (scale warm-up) -------------
+        # The metric scale is read from the floor on the FIRST window, but a single
+        # window's floor RANSAC is noisy and the very first frames (camera settling,
+        # an oblique/partial floor view) often give an OUTLIER scale. Locking the
+        # whole map to that one estimate inflates/shrinks the entire trajectory:
+        # the cameras end up at one scale while later windows' geometry sits at the
+        # true (steady-state) scale, so walls/objects no longer register and the
+        # live map "drifts"/ghosts as the robot moves (the offline gradio run only
+        # looked clean because its curated first frames happened to anchor well).
+        # Fix: for the first ``scale_warmup_windows`` confident windows, re-anchor
+        # the scale to the running MEDIAN of their floor estimates instead of hard-
+        # locking to window 0; once the median has stabilised it locks. Set
+        # SCALE_WARMUP_WINDOWS=1 to restore the old lock-on-first-window behaviour.
+        self.scale_warmup_windows = int(os.environ.get("SCALE_WARMUP_WINDOWS", "3"))
+        self.floor_scale_samples = []
+        self._scale_committed = False
+
         # Gravity / floor leveling. ``world_align`` is a one-time rotation applied to
         # the world frame so the detected floor becomes horizontal; everything fed to
         # nvblox is built in this leveled frame. ``last_floor_plane`` holds the most
@@ -494,9 +511,27 @@ class StreamingWindowEngine:
             # The floor is placed at Z=0, so an upright camera sits at ~+camera height.
             if self.is_first_window:
                 # First submap defines absolute metric scale from the floor (fallback
-                # to a median-depth guess).
-                if floor_scale is not None:
+                # to a median-depth guess). The single mid-frame RANSAC is noisy and
+                # is the estimate most likely to be a damaging OUTLIER, so anchor from
+                # the MEDIAN floor scale across several frames of this first window
+                # (one-time cost) rather than the mid frame alone.
+                first_scales = []
+                for fi in sorted(set([0, mid_idx, self.window_size // 4,
+                                      3 * self.window_size // 4, self.window_size - 1])):
+                    if 0 <= fi < self.window_size:
+                        fs, fc, _fp = estimate_metric_scale_from_floor(
+                            pts_list[fi], target_camera_height=window_heights[fi])
+                        if fs is not None and fc >= self.level_min_confidence:
+                            first_scales.append(float(fs))
+                if first_scales:
+                    s_anchor = float(np.median(first_scales))
+                    self.floor_scale_samples.append(s_anchor)
+                    if floor_scale is not None:
+                        floor_scale = s_anchor   # keep leveling consistent with anchor
+                elif floor_scale is not None:
                     s_anchor = floor_scale
+                    if floor_conf >= self.level_min_confidence:
+                        self.floor_scale_samples.append(float(floor_scale))
                 else:
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
@@ -533,13 +568,34 @@ class StreamingWindowEngine:
                     # Degenerate baseline (camera barely moved across the overlap):
                     # keep the previous metric scale rather than inventing one.
                     s_est = self.current_metric_scale
-                if os.environ.get("LOCK_SCALE_AFTER_FIRST", "1") == "1":
-                    # Anchor metric scale ONCE on the first window; every later window
-                    # REUSES it and estimates only rotation+translation from the
-                    # overlap (the Umeyama rotation is scale-independent). Leaving the
-                    # overlap Sim3 free re-estimates scale each submap; even a ~1%
-                    # drift compounds → the map inflates and submaps no longer fuse in
-                    # the TSDF (ghosting/cloning + unbounded point growth). Set
+
+                # Collect confident floor estimates until the scale is committed.
+                if (not self._scale_committed and floor_scale is not None
+                        and floor_conf >= self.level_min_confidence):
+                    self.floor_scale_samples.append(float(floor_scale))
+
+                if not self._scale_committed and len(self.floor_scale_samples) > 0:
+                    # SCALE WARM-UP: re-anchor to the running MEDIAN of the first few
+                    # confident floor estimates instead of trusting window 0 alone, so
+                    # one bad first-window estimate can't inflate the whole map (which
+                    # leaves the cameras and the geometry at different scales → the
+                    # live-viewer ghosting/drift). The Umeyama rotation is
+                    # scale-independent, so only the placement scale changes here.
+                    s_anchor = float(np.median(self.floor_scale_samples))
+                    if len(self.floor_scale_samples) >= self.scale_warmup_windows:
+                        self._scale_committed = True
+                        print(f"  > [Scale Lock] committed median s={s_anchor:.4f} "
+                              f"over {len(self.floor_scale_samples)} windows")
+                    else:
+                        print(f"  > [Scale Warmup] {len(self.floor_scale_samples)}/"
+                              f"{self.scale_warmup_windows}: median s={s_anchor:.4f} "
+                              f"(this floor s={floor_scale:.4f})")
+                elif os.environ.get("LOCK_SCALE_AFTER_FIRST", "1") == "1":
+                    # Committed: every later window REUSES the locked scale and estimates
+                    # only rotation+translation from the overlap. Leaving the overlap
+                    # Sim3 free re-estimates scale each submap; even a ~1% drift
+                    # compounds → the map inflates and submaps no longer fuse in the TSDF
+                    # (ghosting/cloning + unbounded point growth). Set
                     # LOCK_SCALE_AFTER_FIRST=0 to restore the free-Sim3 behaviour.
                     s_anchor = self.current_metric_scale
                 else:
