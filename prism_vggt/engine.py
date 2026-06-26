@@ -238,12 +238,35 @@ class StreamingWindowEngine:
         :meth:`get_current_cloud` (the current TSDF surface, what gradio shows)."""
         return self.colorizer.get_point_cloud_snapshot()
 
+    @staticmethod
+    def _voxel_snap(xyz: np.ndarray, rgb: np.ndarray, voxel: float):
+        """Collapse a cloud to ONE point per voxel, SNAPPED to the voxel-cell centre
+        (colour = mean of the cell's points). This is what makes streaming scalable:
+        marching-cubes vertices jitter sub-millimetre as nvblox re-meshes, so the raw
+        surface changes everywhere every submap and the content-diff degenerates to a
+        full resend (bandwidth ∝ total map size). Snapping to the fixed voxel grid
+        makes UNCHANGED geometry byte-identical across submaps, so its block CRCs are
+        stable and only the frontier cubes actually transfer (bandwidth ∝ what
+        changed). It also dedups (smaller cloud) and is the true map resolution
+        anyway."""
+        if xyz.shape[0] == 0:
+            return xyz.astype(np.float32), rgb.astype(np.uint8)
+        v = float(voxel) if voxel and voxel > 0 else 0.03
+        keys = np.floor(xyz / v).astype(np.int64)
+        uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+        centers = ((uniq.astype(np.float64) + 0.5) * v).astype(np.float32)
+        sums = np.zeros((uniq.shape[0], 3), dtype=np.float64)
+        np.add.at(sums, inv, rgb.astype(np.float64))
+        counts = np.bincount(inv, minlength=uniq.shape[0]).astype(np.float64)
+        cols = np.clip(np.rint(sums / counts[:, None]), 0, 255).astype(np.uint8)
+        return centers, cols
+
     def get_current_cloud(self) -> Dict[str, Any]:
-        """The CURRENT nvblox TSDF surface as a point cloud — one point per surface
-        voxel (marching-cubes vertices), exactly what the offline gradio path
-        displays. Unlike :meth:`get_point_cloud_snapshot` this is re-derived from the
-        live volume each submap, so a shifted surface REPLACES the old geometry
-        instead of layering on top of it (thin 1-voxel walls, no ghosting). Returns
+        """The CURRENT nvblox TSDF surface as a point cloud, voxel-snapped to one
+        point per cell — what the offline gradio path shows, made streaming-stable.
+        Re-derived from the live volume each submap, so a shifted surface REPLACES the
+        old geometry instead of layering on it (thin walls), and snapping to the voxel
+        grid keeps unchanged cubes byte-identical so the diff stays bounded. Returns
         ``{"points": (N,3) float32, "colors": (N,3) uint8, "version": int}``."""
         pcd = self.last_pcd
         version = self.get_map_version()
@@ -253,6 +276,13 @@ class StreamingWindowEngine:
         xyz = np.asarray(pcd.points, dtype=np.float32)
         cols = np.asarray(pcd.colors, dtype=np.float64)
         rgb = np.clip(np.rint(cols * 255.0), 0, 255).astype(np.uint8)
+        # Voxel-snap is OPT-IN (CLOUD_VOXEL_SNAP=1): it dedups/shrinks the cloud, but
+        # binning marching-cubes vertices flickers cube membership at cell boundaries,
+        # which can flip a (1 m) cube's diff-version even when nothing really changed.
+        # nvblox's marching cubes is deterministic for an unchanged TSDF, so the RAW
+        # vertices + a geometry-only block CRC are the more diff-stable default.
+        if os.environ.get("CLOUD_VOXEL_SNAP", "0") == "1":
+            xyz, rgb = self._voxel_snap(xyz, rgb, self.voxel_size)
         return {"points": xyz, "colors": rgb, "version": version}
 
     def get_point_cloud_delta(self, since_version: int) -> Dict[str, Any]:
