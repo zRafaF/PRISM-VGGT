@@ -229,8 +229,31 @@ class StreamingWindowEngine:
 
     def get_point_cloud_snapshot(self) -> Dict[str, Any]:
         """Full streamable point cloud (one point per color block) + a map_hash the
-        client can compare against to detect drift and trigger a full resync."""
+        client can compare against to detect drift and trigger a full resync.
+
+        WARNING: this is the BlockColorCache, which only ever *adds/updates* blocks —
+        it never removes them. So as the surface shifts between submaps it ACCUMULATES
+        every block ever seen → thick/fuzzy/duplicated walls. It is fine for the
+        versioned delta API, but DO NOT use it as the displayed map. Use
+        :meth:`get_current_cloud` (the current TSDF surface, what gradio shows)."""
         return self.colorizer.get_point_cloud_snapshot()
+
+    def get_current_cloud(self) -> Dict[str, Any]:
+        """The CURRENT nvblox TSDF surface as a point cloud — one point per surface
+        voxel (marching-cubes vertices), exactly what the offline gradio path
+        displays. Unlike :meth:`get_point_cloud_snapshot` this is re-derived from the
+        live volume each submap, so a shifted surface REPLACES the old geometry
+        instead of layering on top of it (thin 1-voxel walls, no ghosting). Returns
+        ``{"points": (N,3) float32, "colors": (N,3) uint8, "version": int}``."""
+        pcd = self.last_pcd
+        version = self.get_map_version()
+        if pcd is None or len(pcd.points) == 0:
+            return {"points": np.zeros((0, 3), np.float32),
+                    "colors": np.zeros((0, 3), np.uint8), "version": version}
+        xyz = np.asarray(pcd.points, dtype=np.float32)
+        cols = np.asarray(pcd.colors, dtype=np.float64)
+        rgb = np.clip(np.rint(cols * 255.0), 0, 255).astype(np.uint8)
+        return {"points": xyz, "colors": rgb, "version": version}
 
     def get_point_cloud_delta(self, since_version: int) -> Dict[str, Any]:
         """Only the blocks changed since ``since_version`` (the delta fast-path). On a
