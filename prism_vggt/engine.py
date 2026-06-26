@@ -671,22 +671,22 @@ class StreamingWindowEngine:
                     "extent": float(max(extent_metric, 0.5)),
                 }
 
-            # ── Depth-integration scale (floor staircase fix) ──────────────────
-            # THE POSE CHAIN scale is locked to the first window for trajectory
-            # stability (LOCK_SCALE_AFTER_FIRST), but VGGT's *native per-window*
-            # scale slowly drifts as the camera explores new scenery. Integrating
-            # depth at the frozen first-window scale then lands each later window's
-            # FLOOR at the wrong height → the floor "climbs" 0/10/20cm per submap
-            # (the duplicated/layered ground). Fix: integrate THIS window's depth at
-            # THIS window's own floor-derived metric scale (which by construction
-            # puts the detected floor at the metric camera height), while leaving
-            # the pose chain on the locked scale. The camera barely moves within a
-            # window, so this only changes local point *sizing* slightly while
-            # keeping every window's floor at Z=0 — no staircase. Falls back to the
-            # locked scale when this window has no confident floor. Disable with
-            # DEPTH_SCALE_FROM_FLOOR=0 to restore the single-locked-scale behaviour.
+            # ── Depth-integration scale ────────────────────────────────────────
+            # Integrate depth at the SINGLE committed metric scale — identical to the
+            # offline gradio pipeline (which reconstructs cleanly). The camera height
+            # only anchors metric scale on the first scene (the warm-up windows); from
+            # then on PanoVGGT carries scale through the locked overlap-Sim3 chain, so
+            # depth must be integrated at that one locked scale for ALL windows.
+            #
+            # DEPTH_SCALE_FROM_FLOOR=1 (opt-in) instead re-scales each window's depth
+            # to that window's own floor estimate. This pins the floor exactly flat,
+            # but because the per-window floor RANSAC has ~±4% noise it makes the
+            # WALLS jitter in size window-to-window → wall ghosting. Only enable it if
+            # you see a genuine MONOTONIC floor climb (native-scale drift across very
+            # different scenes), not the static scatter the noise produces. Default
+            # OFF so the live pipeline matches gradio exactly.
             depth_scale = self.current_metric_scale
-            if (os.environ.get("DEPTH_SCALE_FROM_FLOOR", "1") == "1"
+            if (os.environ.get("DEPTH_SCALE_FROM_FLOOR", "0") == "1"
                     and not self.is_first_window
                     and floor_scale is not None
                     and floor_conf >= self.level_min_confidence):
