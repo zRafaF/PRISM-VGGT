@@ -155,6 +155,7 @@ class StreamingWindowEngine:
         self.prev_overlap_global_poses = []
         self.trajectory = []
         self.full_poses = []
+        self._last_kf_pose = None        # keyframe-gating: last integrated camera pose
         self.pose_timestamps = []      # parallel to full_poses (from FrameInput.timestamp)
         self.processed_indices = []
         self._done_starts = set()      # window-start indices already processed (online mode)
@@ -261,6 +262,28 @@ class StreamingWindowEngine:
         cols = np.clip(np.rint(sums / counts[:, None]), 0, 255).astype(np.uint8)
         return centers, cols
 
+    def _keyframe_accept(self, global_pose) -> bool:
+        """True if the camera moved enough since the last integrated keyframe (or
+        gating is disabled / this is the first keyframe). Translation OR rotation
+        over the configured thresholds counts as motion. Skipping near-static frames
+        stops the TSDF from re-integrating an unchanged view (sub-voxel "breathing"
+        that churns block CRCs and slowly thickens/ghosts walls)."""
+        min_t = float(getattr(self, "keyframe_min_trans_m", 0.0) or 0.0)
+        min_r = float(getattr(self, "keyframe_min_rot_deg", 0.0) or 0.0)
+        if min_t <= 0.0 and min_r <= 0.0:
+            return True
+        prev = getattr(self, "_last_kf_pose", None)
+        if prev is None:
+            return True
+        if min_t > 0.0 and float(np.linalg.norm(global_pose[:3, 3] - prev[:3, 3])) >= min_t:
+            return True
+        if min_r > 0.0:
+            Rrel = prev[:3, :3].T @ global_pose[:3, :3]
+            cos = (np.trace(Rrel) - 1.0) * 0.5
+            if np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))) >= min_r:
+                return True
+        return False
+
     def get_current_cloud(self) -> Dict[str, Any]:
         """The CURRENT nvblox TSDF surface as a point cloud, voxel-snapped to one
         point per cell — what the offline gradio path shows, made streaming-stable.
@@ -281,7 +304,7 @@ class StreamingWindowEngine:
         # which can flip a (1 m) cube's diff-version even when nothing really changed.
         # nvblox's marching cubes is deterministic for an unchanged TSDF, so the RAW
         # vertices + a geometry-only block CRC are the more diff-stable default.
-        if os.environ.get("CLOUD_VOXEL_SNAP", "0") == "1":
+        if getattr(self, "cloud_voxel_snap", False) or os.environ.get("CLOUD_VOXEL_SNAP", "0") == "1":
             xyz, rgb = self._voxel_snap(xyz, rgb, self.voxel_size)
         return {"points": xyz, "colors": rgb, "version": version}
 
@@ -766,21 +789,27 @@ class StreamingWindowEngine:
                     self.full_poses.append(global_pose)
                     self.pose_timestamps.append(window_timestamps[j])
 
-                    tsdf_pose = global_pose.copy()
+                    # ── Keyframe gating (online ghost/breathing/bandwidth fix) ──
+                    # Integrate only if the camera moved enough vs the last keyframe.
+                    # Pose bookkeeping above stays unconditional so the trajectory and
+                    # pose-correction chain are intact even on skipped frames.
+                    if self._keyframe_accept(global_pose):
+                        tsdf_pose = global_pose.copy()
 
-                    # Cubemap upside-down guard. The camera's down axis (col 1, image
-                    # +Y) should point toward world -Z; if it points +Z the camera is
-                    # flipped, so rotate 180 deg about its X to re-orient the faces.
-                    if tsdf_pose[2, 1] > 0:
-                        tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                        # Cubemap upside-down guard. The camera's down axis (col 1,
+                        # image +Y) should point toward world -Z; if it points +Z the
+                        # camera is flipped, so rotate 180 deg about its X.
+                        if tsdf_pose[2, 1] > 0:
+                            tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
 
-                    scaled_pts = pts_list[j] * depth_scale
-                    depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
+                        scaled_pts = pts_list[j] * depth_scale
+                        depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
 
-                    batch_depths.append(depth_map)
-                    batch_rgbs.append(window_frames[j])
-                    batch_masks.append(window_masks[j])
-                    batch_poses.append(tsdf_pose)
+                        batch_depths.append(depth_map)
+                        batch_rgbs.append(window_frames[j])
+                        batch_masks.append(window_masks[j])
+                        batch_poses.append(tsdf_pose)
+                        self._last_kf_pose = global_pose.copy()
 
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
@@ -813,6 +842,16 @@ class StreamingWindowEngine:
                 self.tsdf_future = None
             profiler["TSDF_Integrate"] = time.time() - t_integ
 
+            # Optional active carving of stale voxels via nvblox decay (guarded;
+            # off unless enabled, and no-ops loudly-once if the API isn't present).
+            if getattr(self, "tsdf_decay", False):
+                try:
+                    self.tsdf.decay()
+                except Exception as _e:
+                    if not getattr(self, "_decay_warned", False):
+                        print(f"  > [Decay] nvblox decay unavailable, skipping: {_e}")
+                        self._decay_warned = True
+
             # --- ESDF (optional, off by default) --------------------------------
             if self.compute_esdf:
                 t_esdf = time.time()
@@ -824,7 +863,11 @@ class StreamingWindowEngine:
             # TOTAL map size, so only do it every ``mesh_extract_every`` submaps.
             # Depth was already integrated this submap (above); nvblox re-meshes every
             # block dirtied since the last update on the next extraction.
-            do_extract = (self.submap_count % max(1, int(self.mesh_extract_every)) == 0)
+            # Skip extraction when nothing was integrated this window (fully gated /
+            # static): re-coloring with an empty batch would blank the cloud, and
+            # re-meshing an unchanged volume just wastes time.
+            do_extract = (len(batch_poses) > 0
+                          and self.submap_count % max(1, int(self.mesh_extract_every)) == 0)
             if do_extract:
                 # Marching cubes is incremental in nvblox and shared by both paths.
                 t0 = time.time()

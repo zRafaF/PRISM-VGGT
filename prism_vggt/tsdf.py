@@ -134,6 +134,19 @@ class NvbloxPanoTSDF:
         except Exception:  # pragma: no cover - depends on nvblox build
             return 0
 
+    def decay(self):
+        """Decay the TSDF/occupancy so voxels that stop being observed fade and are
+        eventually carved away (active removal of stale geometry / ghosts). nvblox
+        exposes this under a few names across builds; try them in order and raise if
+        none exist so the caller's guard can disable it. Tune cadence/params on-rig."""
+        mapper = self.mapper
+        for name in ("decay_tsdf", "decay_occupancy", "decay"):
+            fn = getattr(mapper, name, None)
+            if callable(fn):
+                fn()
+                return
+        raise AttributeError("nvblox Mapper has no decay_tsdf/decay_occupancy/decay")
+
     def update_esdf(self):
         """Recompute the Euclidean Signed Distance Field from the current TSDF.
         Only needed if you query the ESDF (collision distances) for planning."""
