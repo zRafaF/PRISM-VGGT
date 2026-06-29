@@ -134,18 +134,40 @@ class NvbloxPanoTSDF:
         except Exception:  # pragma: no cover - depends on nvblox build
             return 0
 
+    # Resolved once: the decay method this nvblox build actually exposes.
+    _decay_fn = None
+    _decay_name = None
+
     def decay(self):
-        """Decay the TSDF/occupancy so voxels that stop being observed fade and are
-        eventually carved away (active removal of stale geometry / ghosts). nvblox
-        exposes this under a few names across builds; try them in order and raise if
-        none exist so the caller's guard can disable it. Tune cadence/params on-rig."""
-        mapper = self.mapper
-        for name in ("decay_tsdf", "decay_occupancy", "decay"):
-            fn = getattr(mapper, name, None)
-            if callable(fn):
-                fn()
-                return
-        raise AttributeError("nvblox Mapper has no decay_tsdf/decay_occupancy/decay")
+        """Decay the TSDF so voxels that stop being observed fade and are eventually
+        carved (active removal of stale geometry / drift ghosts). Different nvblox_torch
+        builds expose this under different names and on either the Python Mapper or the
+        underlying C++ object, so we INTROSPECT once: prefer TSDF decay (this is a TSDF
+        map), then generic, then occupancy. Raises if none found so the caller's guard
+        can disable it cleanly and tell you what to look for. Call only on submaps where
+        you ALSO integrated, or a 360° map will slowly erode itself."""
+        if self._decay_fn is None:
+            mapper = self.mapper
+            cands = ["decay_tsdf", "decayTsdf", "decay", "decay_occupancy", "decayOccupancy"]
+            objs = [mapper, getattr(mapper, "_c_mapper", None), getattr(mapper, "mapper", None)]
+            for obj in objs:
+                if obj is None:
+                    continue
+                for name in cands:
+                    fn = getattr(obj, name, None)
+                    if callable(fn):
+                        self._decay_fn, self._decay_name = fn, name
+                        print(f"[TSDF] nvblox decay → {type(obj).__name__}.{name}()")
+                        break
+                if self._decay_fn is not None:
+                    break
+            if self._decay_fn is None:
+                have = [m for m in dir(self.mapper) if "decay" in m.lower()]
+                raise AttributeError(
+                    "no nvblox decay method found; methods containing 'decay' on "
+                    f"self.tsdf.mapper = {have}. Set TSDF_DECAY=0 or wire the right one.")
+        # Most builds take an optional mapper_id (default -1 = all layers); call bare.
+        self._decay_fn()
 
     def update_esdf(self):
         """Recompute the Euclidean Signed Distance Field from the current TSDF.
