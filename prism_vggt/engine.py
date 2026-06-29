@@ -125,6 +125,8 @@ class StreamingWindowEngine:
         # ~77 MB/window (12×518×1036×3 f32); tune PERC_CACHE_WINDOWS for RAM.
         self._perc_cache_max = int(os.environ.get("PERC_CACHE_WINDOWS", "16"))
         self._perc_cache = OrderedDict() if self._perc_cache_max > 0 else None
+        self._perc_hits = 0
+        self._perc_misses = 0
         self.perc_future = None
         self.tsdf = None
 
@@ -227,12 +229,14 @@ class StreamingWindowEngine:
             hit = cache.get(key)
             if hit is not None:
                 cache.move_to_end(key)
+                self._perc_hits += 1
                 out = dict(hit)
                 out["_infer_time"] = 0.0      # served from cache → no inference cost
                 return out
         t = time.time()
         preds = self.perception.process_sequence([f.image for f in window])
         preds["_infer_time"] = time.time() - t
+        self._perc_misses += 1
         if cache is not None and key is not None:
             cache[key] = {k: v for k, v in preds.items() if k != "_infer_time"}
             while len(cache) > self._perc_cache_max:
