@@ -845,12 +845,14 @@ class StreamingWindowEngine:
             # Optional active carving of stale voxels via nvblox decay (guarded;
             # off unless enabled, and no-ops loudly-once if the API isn't present).
             if getattr(self, "tsdf_decay", False) and len(batch_poses) > 0:
-                try:
-                    self.tsdf.decay()
-                except Exception as _e:
-                    if not getattr(self, "_decay_warned", False):
-                        print(f"  > [Decay] nvblox decay unavailable, skipping: {_e}")
-                        self._decay_warned = True
+                self._decay_count = getattr(self, "_decay_count", 0) + 1
+                if self._decay_count % max(1, int(getattr(self, "decay_every_n", 1))) == 0:
+                    try:
+                        self.tsdf.decay()
+                    except Exception as _e:
+                        if not getattr(self, "_decay_warned", False):
+                            print(f"  > [Decay] nvblox decay unavailable, skipping: {_e}")
+                            self._decay_warned = True
 
             # --- ESDF (optional, off by default) --------------------------------
             if self.compute_esdf:
