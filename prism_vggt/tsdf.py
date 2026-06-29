@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -7,6 +8,15 @@ from nvblox_torch.mapper import Mapper, QueryType
 from nvblox_torch.sensor import Sensor
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 from nvblox_torch.constants import constants
+
+# Anti-erosion depth-edge mask (env-tunable). The integrator drops pixels at depth
+# discontinuities to avoid smeared "erosion" surfaces. Too aggressive a dilation also
+# erases small/thin objects (a backpack on a table). Lower EDGE_DILATE_PX (e.g. 3) and/or
+# raise EDGE_REJECT_THRESH to keep more of small DYNAMIC objects.
+_EDGE_SMOOTH = float(os.environ.get("EDGE_SMOOTH_THRESH", "0.08"))   # keep pixels smoother than this (m)
+_EDGE_REJECT = float(os.environ.get("EDGE_REJECT_THRESH", "0.15"))   # treat as a depth edge above this (m)
+_EDGE_DILATE = int(os.environ.get("EDGE_DILATE_PX", "7")) | 1        # dilation kernel (forced odd)
+
 
 class NvbloxPanoTSDF:
     def __init__(self, voxel_size_m=0.02, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
@@ -81,10 +91,11 @@ class NvbloxPanoTSDF:
         # Anti-erosion edge detection
         diff_x = torch.abs(pano_depth_map - torch.roll(pano_depth_map, shifts=-1, dims=1))
         diff_y = torch.abs(pano_depth_map - torch.roll(pano_depth_map, shifts=-1, dims=0))
-        mask = mask * ((diff_x < 0.08) & (diff_y < 0.08)).float()
+        mask = mask * ((diff_x < _EDGE_SMOOTH) & (diff_y < _EDGE_SMOOTH)).float()
         
-        edges = ((diff_x > 0.15) | (diff_y > 0.15)).float().unsqueeze(0).unsqueeze(0)
-        dilated_edges = F.max_pool2d(edges, kernel_size=7, stride=1, padding=3).squeeze()
+        edges = ((diff_x > _EDGE_REJECT) | (diff_y > _EDGE_REJECT)).float().unsqueeze(0).unsqueeze(0)
+        dilated_edges = F.max_pool2d(edges, kernel_size=_EDGE_DILATE, stride=1,
+                                     padding=_EDGE_DILATE // 2).squeeze()
         mask = mask * (dilated_edges == 0.0).float()
 
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
@@ -134,40 +145,86 @@ class NvbloxPanoTSDF:
         except Exception:  # pragma: no cover - depends on nvblox build
             return 0
 
-    # Resolved once: the decay method this nvblox build actually exposes.
+    # Resolved once (introspected): the decay + deallocate methods this nvblox build
+    # actually exposes. TSDF maps MUST decay the TSDF layer — decaying only the
+    # occupancy layer (unused here) does nothing visible, which is the usual reason
+    # "old points never disappear".
     _decay_fn = None
     _decay_name = None
+    _dealloc_fn = None
+
+    @staticmethod
+    def _call_any(fn):
+        """Call an nvblox method that may take no args or an optional mapper_id."""
+        for args in ((), (-1,), (0,)):
+            try:
+                fn(*args)
+                return True
+            except TypeError:
+                continue
+        fn()  # last resort: surface the real error
+        return True
+
+    def _resolve_decay(self):
+        mapper = self.mapper
+        objs = [("Mapper", mapper),
+                ("c_mapper", getattr(mapper, "_c_mapper", None)),
+                ("mapper", getattr(mapper, "mapper", None))]
+        # one-time report of what this build exposes (so a wrong/missing API is obvious)
+        found = {}
+        for label, obj in objs:
+            if obj is None:
+                continue
+            for m in dir(obj):
+                ml = m.lower()
+                if any(k in ml for k in ("decay", "deallocate")) and not m.startswith("__"):
+                    found.setdefault(label, []).append(m)
+        print(f"[TSDF] nvblox decay/deallocate methods available: {found or 'NONE'}")
+        # prefer TSDF decay; generic decay; occupancy LAST (won't carve a TSDF mesh)
+        for name in ("decay_tsdf", "decayTsdf", "decay", "decay_occupancy", "decayOccupancy"):
+            for _label, obj in objs:
+                fn = getattr(obj, name, None) if obj is not None else None
+                if callable(fn):
+                    self._decay_fn, self._decay_name = fn, name
+                    break
+            if self._decay_fn is not None:
+                break
+        if self._decay_name in ("decay_occupancy", "decayOccupancy"):
+            print("[TSDF] WARNING: only OCCUPANCY decay found — this is a TSDF map, so it "
+                  "will NOT carve the mesh. Old geometry won't disappear via decay; use the "
+                  "sliding-window mode (PRISM_RESET_EACH_BATCH=1) for dynamic scenes.")
+        elif self._decay_name:
+            print(f"[TSDF] nvblox decay → {self._decay_name}() (TSDF carving active)")
+        # optional: free fully-decayed blocks so they leave the mesh + the manifest
+        for name in ("deallocate_fully_decayed_blocks", "deallocateFullyDecayedBlocks",
+                     "update_hashmaps"):
+            for _label, obj in objs:
+                fn = getattr(obj, name, None) if obj is not None else None
+                if callable(fn):
+                    self._dealloc_fn = fn
+                    print(f"[TSDF] nvblox deallocate → {name}()")
+                    break
+            if self._dealloc_fn is not None:
+                break
+        if self._decay_fn is None:
+            raise AttributeError(
+                "no nvblox decay method found. Methods seen: "
+                f"{found}. Set TSDF_DECAY=0 (and use PRISM_RESET_EACH_BATCH=1 for dynamics).")
 
     def decay(self):
-        """Decay the TSDF so voxels that stop being observed fade and are eventually
-        carved (active removal of stale geometry / drift ghosts). Different nvblox_torch
-        builds expose this under different names and on either the Python Mapper or the
-        underlying C++ object, so we INTROSPECT once: prefer TSDF decay (this is a TSDF
-        map), then generic, then occupancy. Raises if none found so the caller's guard
-        can disable it cleanly and tell you what to look for. Call only on submaps where
-        you ALSO integrated, or a 360° map will slowly erode itself."""
+        """Decay the TSDF so voxels that stop being observed (or are contradicted by a
+        new observation — e.g. a moved object) fade and are eventually carved. Resolved
+        once via introspection (see _resolve_decay), then called every integrated submap.
+        A 360° camera re-observes everything in range, so observed surfaces are refreshed
+        and only stale geometry decays away."""
         if self._decay_fn is None:
-            mapper = self.mapper
-            cands = ["decay_tsdf", "decayTsdf", "decay", "decay_occupancy", "decayOccupancy"]
-            objs = [mapper, getattr(mapper, "_c_mapper", None), getattr(mapper, "mapper", None)]
-            for obj in objs:
-                if obj is None:
-                    continue
-                for name in cands:
-                    fn = getattr(obj, name, None)
-                    if callable(fn):
-                        self._decay_fn, self._decay_name = fn, name
-                        print(f"[TSDF] nvblox decay → {type(obj).__name__}.{name}()")
-                        break
-                if self._decay_fn is not None:
-                    break
-            if self._decay_fn is None:
-                have = [m for m in dir(self.mapper) if "decay" in m.lower()]
-                raise AttributeError(
-                    "no nvblox decay method found; methods containing 'decay' on "
-                    f"self.tsdf.mapper = {have}. Set TSDF_DECAY=0 or wire the right one.")
-        # Most builds take an optional mapper_id (default -1 = all layers); call bare.
-        self._decay_fn()
+            self._resolve_decay()
+        self._call_any(self._decay_fn)
+        if self._dealloc_fn is not None:
+            try:
+                self._call_any(self._dealloc_fn)
+            except Exception:
+                pass
 
     def update_esdf(self):
         """Recompute the Euclidean Signed Distance Field from the current TSDF.

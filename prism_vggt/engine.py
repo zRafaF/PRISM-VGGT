@@ -156,6 +156,7 @@ class StreamingWindowEngine:
         self.trajectory = []
         self.full_poses = []
         self._last_kf_pose = None        # keyframe-gating: last integrated camera pose
+        self._last_kf_t = None           # capture time of last integrated keyframe
         self.pose_timestamps = []      # parallel to full_poses (from FrameInput.timestamp)
         self.processed_indices = []
         self._done_starts = set()      # window-start indices already processed (online mode)
@@ -262,12 +263,12 @@ class StreamingWindowEngine:
         cols = np.clip(np.rint(sums / counts[:, None]), 0, 255).astype(np.uint8)
         return centers, cols
 
-    def _keyframe_accept(self, global_pose) -> bool:
-        """True if the camera moved enough since the last integrated keyframe (or
-        gating is disabled / this is the first keyframe). Translation OR rotation
-        over the configured thresholds counts as motion. Skipping near-static frames
-        stops the TSDF from re-integrating an unchanged view (sub-voxel "breathing"
-        that churns block CRCs and slowly thickens/ghosts walls)."""
+    def _keyframe_accept(self, global_pose, ts=None) -> bool:
+        """True if this frame should be integrated. Accept on enough motion since the
+        last keyframe (skips static "breathing"), OR if too long has passed since the
+        last keyframe — the TIME ESCAPE: a (near-)static 360° robot must keep
+        re-observing so DYNAMIC changes (a moved/new object) are integrated and decayed
+        in, instead of the map freezing on first sight. Gating disabled → always True."""
         min_t = float(getattr(self, "keyframe_min_trans_m", 0.0) or 0.0)
         min_r = float(getattr(self, "keyframe_min_rot_deg", 0.0) or 0.0)
         if min_t <= 0.0 and min_r <= 0.0:
@@ -275,6 +276,11 @@ class StreamingWindowEngine:
         prev = getattr(self, "_last_kf_pose", None)
         if prev is None:
             return True
+        max_dt = float(getattr(self, "keyframe_max_interval_s", 0.0) or 0.0)
+        if max_dt > 0.0 and ts is not None:
+            last_t = getattr(self, "_last_kf_t", None)
+            if last_t is None or (float(ts) - float(last_t)) >= max_dt:
+                return True
         if min_t > 0.0 and float(np.linalg.norm(global_pose[:3, 3] - prev[:3, 3])) >= min_t:
             return True
         if min_r > 0.0:
@@ -793,7 +799,7 @@ class StreamingWindowEngine:
                     # Integrate only if the camera moved enough vs the last keyframe.
                     # Pose bookkeeping above stays unconditional so the trajectory and
                     # pose-correction chain are intact even on skipped frames.
-                    if self._keyframe_accept(global_pose):
+                    if self._keyframe_accept(global_pose, window_timestamps[j]):
                         tsdf_pose = global_pose.copy()
 
                         # Cubemap upside-down guard. The camera's down axis (col 1,
@@ -810,6 +816,7 @@ class StreamingWindowEngine:
                         batch_masks.append(window_masks[j])
                         batch_poses.append(tsdf_pose)
                         self._last_kf_pose = global_pose.copy()
+                        self._last_kf_t = window_timestamps[j]
 
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
