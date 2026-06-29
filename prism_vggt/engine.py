@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import open3d as o3d
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 
 from .tsdf import NvbloxPanoTSDF
 from .perception_base import BasePerceptionExtractor
@@ -116,6 +117,14 @@ class StreamingWindowEngine:
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
         self.tsdf_future = None
         self.perc_executor = ThreadPoolExecutor(max_workers=1)
+        # Perception (VGGT forward) memo, keyed by a window's frame identities. The
+        # network output is deterministic for the same frames, and consecutive batches
+        # (especially reset mode, which re-runs the WHOLE window) re-request mostly the
+        # same windows — so caching turns ~7 inferences/batch into ~1. Deliberately NOT
+        # cleared in reset(), so a fresh rebuild reuses already-computed perception.
+        # ~77 MB/window (12×518×1036×3 f32); tune PERC_CACHE_WINDOWS for RAM.
+        self._perc_cache_max = int(os.environ.get("PERC_CACHE_WINDOWS", "16"))
+        self._perc_cache = OrderedDict() if self._perc_cache_max > 0 else None
         self.perc_future = None
         self.tsdf = None
 
@@ -208,10 +217,26 @@ class StreamingWindowEngine:
 
     def _timed_perception(self, window: List[FrameInput]) -> Dict[str, Any]:
         """Run perception on a window of FrameInputs and stash its true wall-clock
-        cost in the result, so the (background) inference time stays visible."""
+        cost in the result. Memoised by frame identity (see _perc_cache): the same
+        window of frames never re-runs the VGGT forward (the reset-mode latency fix)."""
+        cache = self._perc_cache
+        key = None
+        if cache is not None:
+            key = tuple(int(round(float(getattr(f, "timestamp", i)) * 1e9))
+                        for i, f in enumerate(window))
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+                out = dict(hit)
+                out["_infer_time"] = 0.0      # served from cache → no inference cost
+                return out
         t = time.time()
         preds = self.perception.process_sequence([f.image for f in window])
         preds["_infer_time"] = time.time() - t
+        if cache is not None and key is not None:
+            cache[key] = {k: v for k, v in preds.items() if k != "_infer_time"}
+            while len(cache) > self._perc_cache_max:
+                cache.popitem(last=False)
         return preds
 
     # --- Point-cloud streaming API (delegated to the BlockColorCache) ------- #
@@ -562,7 +587,7 @@ class StreamingWindowEngine:
                 profiler["Perception_Wait"] = time.time() - t1
                 profiler["Perception_Infer(bg)"] = preds.pop("_infer_time", 0.0)
             else:
-                preds = self.perception.process_sequence(window_frames)
+                preds = self._timed_perception(window)   # cached forward
                 torch.cuda.synchronize()
                 # Release the perception activations and return reserved blocks to the
                 # driver so the nvblox C++ allocator has room to grow.
