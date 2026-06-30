@@ -878,9 +878,26 @@ class StreamingWindowEngine:
                 self.tsdf_future = None
             profiler["TSDF_Integrate"] = time.time() - t_integ
 
+            # TSDF prune (navigation local map): clear the nvblox volume outside a sphere
+            # around the robot, so the ESDF only reflects a bounded, recent area AND the
+            # mesh-pull cost (Mesh_GetHandles, the live-latency driver) stays constant as
+            # the robot travels. Supersedes decay when on. tsdf_prune_radius<=0 → off, i.e.
+            # full accumulation for SoTA benchmarks (set by the caller).
+            pruned = False
+            prune_r = float(getattr(self, "tsdf_prune_radius", 0.0) or 0.0)
+            if prune_r > 0 and len(batch_poses) > 0:
+                try:
+                    center = np.asarray(batch_poses[-1], dtype=np.float32)[:3, 3]
+                    self.tsdf.prune_outside_radius(center, prune_r)
+                    pruned = True
+                except Exception as _e:
+                    if not getattr(self, "_prune_warned", False):
+                        print(f"  > [Prune] nvblox TSDF prune unavailable, skipping: {_e}")
+                        self._prune_warned = True
+
             # Optional active carving of stale voxels via nvblox decay (guarded;
             # off unless enabled, and no-ops loudly-once if the API isn't present).
-            if getattr(self, "tsdf_decay", False) and len(batch_poses) > 0:
+            if not pruned and getattr(self, "tsdf_decay", False) and len(batch_poses) > 0:
                 self._decay_count = getattr(self, "_decay_count", 0) + 1
                 if self._decay_count % max(1, int(getattr(self, "decay_every_n", 1))) == 0:
                     try:

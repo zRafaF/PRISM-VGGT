@@ -152,6 +152,12 @@ class NvbloxPanoTSDF:
     _decay_fn = None
     _decay_name = None
     _dealloc_fn = None
+    # Radius-clear (egocentric local-map prune of the TSDF, so the ESDF used for
+    # navigation only ever reflects a bounded, recent volume). Resolved once.
+    _prune_fn = None
+    _prune_name = None
+    _prune_resolved = False
+    _prune_warned = False
 
     @staticmethod
     def _call_any(fn):
@@ -225,6 +231,70 @@ class NvbloxPanoTSDF:
                 self._call_any(self._dealloc_fn)
             except Exception:
                 pass
+
+    def _resolve_prune(self):
+        """Find this nvblox build's radius-clear method (clears blocks outside a sphere
+        — nvblox's egocentric/local-map primitive, e.g. isaac_ros_nvblox's
+        `map_clearing_radius_m`). Falls back to decay+deallocate if the binding doesn't
+        expose one. Reports what it found, like _resolve_decay."""
+        self._prune_resolved = True
+        mapper = self.mapper
+        objs = [("Mapper", mapper),
+                ("c_mapper", getattr(mapper, "_c_mapper", None)),
+                ("mapper", getattr(mapper, "mapper", None))]
+        found = {}
+        for label, obj in objs:
+            if obj is None:
+                continue
+            for m in dir(obj):
+                ml = m.lower().replace("_", "")
+                if "outsideradius" in ml or ("clear" in ml and "radius" in ml):
+                    found.setdefault(label, []).append(m)
+        print(f"[TSDF] nvblox radius-clear methods available: {found or 'NONE'}")
+        for name in ("clear_outside_radius", "clearOutsideRadius",
+                     "clear_blocks_outside_radius", "clearBlocksOutsideRadius"):
+            for _label, obj in objs:
+                fn = getattr(obj, name, None) if obj is not None else None
+                if callable(fn):
+                    self._prune_fn, self._prune_name = fn, name
+                    print(f"[TSDF] nvblox TSDF prune → {name}() (ESDF will be bounded to the local sphere)")
+                    return
+        print("[TSDF] WARNING: no nvblox radius-clear in this build — TSDF prune falls "
+              "back to decay+deallocate (weight-based). Build nvblox with clearOutsideRadius "
+              "for a hard local-map bound, or set TSDF_PRUNE_RADIUS_M=0 for benchmarks.")
+
+    def prune_outside_radius(self, center, radius):
+        """Prune the nvblox TSDF to a sphere of ``radius`` m around ``center`` (the robot),
+        so the ESDF used for navigation only sees a bounded, recent local volume — and the
+        mesh-extraction cost stays ~constant as the robot travels (bounds the live latency).
+
+        Uses nvblox's native radius-clear when the build exposes it (a hard spatial bound);
+        otherwise falls back to decay+deallocate. The caller disables this entirely when
+        radius<=0 (full accumulation — for SoTA benchmarks)."""
+        if radius is None or radius <= 0:
+            return
+        if not self._prune_resolved:
+            self._resolve_prune()
+        c = (center.detach().cpu().numpy() if isinstance(center, torch.Tensor)
+             else np.asarray(center))
+        c = np.asarray(c, dtype=np.float32).reshape(3)
+        if self._prune_fn is not None:
+            # Tolerate the binding's exact signature: (array, r) / (tensor, r) / (x,y,z,r).
+            for args in ((c, float(radius)),
+                         (torch.from_numpy(c), float(radius)),
+                         (float(c[0]), float(c[1]), float(c[2]), float(radius))):
+                try:
+                    self._prune_fn(*args)
+                    return
+                except TypeError:
+                    continue
+                except Exception as e:
+                    if not self._prune_warned:
+                        print(f"[TSDF] radius prune call failed ({e}); falling back to decay.")
+                        self._prune_warned = True
+                    break
+        # Fallback: weight-based shrink (decay then free fully-decayed blocks → leaves ESDF).
+        self.decay()
 
     def update_esdf(self):
         """Recompute the Euclidean Signed Distance Field from the current TSDF.
