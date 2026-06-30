@@ -17,6 +17,18 @@ _EDGE_SMOOTH = float(os.environ.get("EDGE_SMOOTH_THRESH", "0.08"))   # keep pixe
 _EDGE_REJECT = float(os.environ.get("EDGE_REJECT_THRESH", "0.15"))   # treat as a depth edge above this (m)
 _EDGE_DILATE = int(os.environ.get("EDGE_DILATE_PX", "7")) | 1        # dilation kernel (forced odd)
 
+# ── TSDF decay tuning (time/batch sliding window for nav) ────────────────────
+# nvblox multiplies every voxel's weight by TSDF_DECAY_FACTOR on each decay() call
+# and deallocates voxels whose weight falls below the threshold. Re-observed voxels
+# recover their weight via integration, so calling decay() once per submap keeps what
+# the robot currently sees and fades what it has left — a per-submap sliding window of
+# length K ≈ ln(threshold/W)/ln(factor) submaps. nvblox's DEFAULT 0.95 fades over ~180
+# submaps (≈ never) — the reason carving looked broken. 0.8 ≈ ~30 submaps; lower =
+# shorter memory / more aggressive carving. TSDF_DECAY_SET_FREE makes a fully-decayed
+# voxel read as FREE distance so the ESDF treats reclaimed space as traversable (nav).
+_DECAY_FACTOR = float(os.environ.get("TSDF_DECAY_FACTOR", "0.8"))
+_DECAY_SET_FREE = os.environ.get("TSDF_DECAY_SET_FREE", "1") == "1"
+
 
 class NvbloxPanoTSDF:
     def __init__(self, voxel_size_m=0.02, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
@@ -33,7 +45,26 @@ class NvbloxPanoTSDF:
         
         mapper_params = MapperParams()
         mapper_params.set_projective_integrator_params(proj_params)
-        
+
+        # Decay tuning (see _DECAY_FACTOR notes above). nvblox's default factor (0.95) is
+        # far too gentle to carve within a session; set a usable factor + deallocate +
+        # free-distance-on-decayed so decay() actually reclaims space in the ESDF.
+        try:
+            _d = mapper_params.get_tsdf_decay_integrator_params()
+            _d.tsdf_decay_factor = _DECAY_FACTOR
+            _d.tsdf_set_free_distance_on_decayed = _DECAY_SET_FREE
+            mapper_params.set_tsdf_decay_integrator_params(_d)
+            _b = mapper_params.get_decay_integrator_base_params()
+            _b.decay_integrator_deallocate_decayed_blocks = True
+            mapper_params.set_decay_integrator_base_params(_b)
+            import math
+            _k = int(math.log(1e-3 / 10.0) / math.log(max(min(_DECAY_FACTOR, 0.999), 1e-3)))
+            print(f"[TSDF] decay tuned: factor={_DECAY_FACTOR} (~{_k} submaps to carve), "
+                  f"set_free_on_decayed={_DECAY_SET_FREE}, deallocate=True")
+        except Exception as e:  # pragma: no cover - depends on nvblox build
+            print(f"[TSDF] could not set decay params ({e}); using nvblox defaults "
+                  f"(decay will be too gentle to carve — check the nvblox version)")
+
         self.mapper = Mapper(
             voxel_sizes_m=self.voxel_size_m,
             mapper_parameters=mapper_params
