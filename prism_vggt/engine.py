@@ -238,6 +238,15 @@ class StreamingWindowEngine:
         self.scale_warmup_windows = int(os.environ.get("SCALE_WARMUP_WINDOWS", "3"))
         self.floor_scale_samples = []
         self._scale_committed = False
+        # Reset-boundary scale RETUNE (drift-correction; default OFF). Once committed, the
+        # metric scale is normally frozen (LOCK_SCALE_AFTER_FIRST). With this on, at each
+        # RESET rebuild — and only if the floor is re-observed with confidence ≥ min_conf —
+        # the locked scale is nudged toward the fresh floor estimate by a SMALL gain, ONCE
+        # per batch. Reset-only + confidence-gated + small gain gives slow correction
+        # without the per-submap free-Sim3 compounding (map inflation/ghosting).
+        self._reset_rescale = os.environ.get("RESET_RESCALE_ON_FLOOR", "0") == "1"
+        self._reset_rescale_gain = float(os.environ.get("RESET_RESCALE_GAIN", "0.15"))
+        self._reset_rescale_min_conf = float(os.environ.get("RESET_RESCALE_MIN_CONF", "0.6"))
 
         # Gravity / floor leveling. ``world_align`` is a one-time rotation applied to
         # the world frame so the detected floor becomes horizontal; everything fed to
@@ -596,6 +605,9 @@ class StreamingWindowEngine:
                 self._timed_perception, frames[first : first + self.window_size]
             )
 
+        # One reset-rescale nudge per batch (see the committed-scale branch below).
+        did_reset_rescale = False
+
         for k, i in enumerate(starts):
             self.vram_tracker.start()
             t_win_start = time.time()
@@ -752,6 +764,23 @@ class StreamingWindowEngine:
                     # (ghosting/cloning + unbounded point growth). Set
                     # LOCK_SCALE_AFTER_FIRST=0 to restore the free-Sim3 behaviour.
                     s_anchor = self.current_metric_scale
+                    # OPTIONAL slow drift-correction (default OFF): on a RESET rebuild, if
+                    # the floor is re-observed confidently, nudge the locked scale toward
+                    # the fresh floor estimate ONCE per batch by a small gain. Reset-only +
+                    # confidence-gated + small gain avoids the per-submap compounding the
+                    # free-Sim3 path (below) suffers. Otherwise we keep the locked (VGGT)
+                    # scale untouched — a low-confidence floor never perturbs it.
+                    if (self._reset_rescale and self._scale_committed and reset
+                            and not did_reset_rescale and floor_scale is not None
+                            and floor_conf >= self._reset_rescale_min_conf):
+                        g = self._reset_rescale_gain
+                        s_anchor = float(np.clip(
+                            (1.0 - g) * self.current_metric_scale + g * float(floor_scale),
+                            0.1, 5.0))
+                        did_reset_rescale = True
+                        print(f"  > [Scale Retune] reset floor conf={floor_conf:.2f}: "
+                              f"s {self.current_metric_scale:.4f} → {s_anchor:.4f} "
+                              f"(gain {g})")
                 else:
                     if (os.environ.get("SCALE_TRACK_FLOOR", "0") == "1"
                             and floor_scale is not None and floor_conf > 0.4):
