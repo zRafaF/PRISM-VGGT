@@ -169,6 +169,19 @@ class NvbloxPanoTSDF:
         self.update_mesh()
         return self.get_color_mesh_raw().to_open3d()
 
+    def clear(self):
+        """Wipe the nvblox volume IN PLACE, keeping the allocated Mapper object, its
+        block-hash capacity, GPU memory pools, sensor and precomputed cubemap grids.
+
+        This is the low-latency reset primitive. Reconstructing ``NvbloxPanoTSDF``
+        (a fresh ``Mapper``) re-allocates CUDA memory and regrows the block hash from
+        zero (the power-of-two resize spikes) on EVERY batch — that is the "restarting
+        the TSDF map takes a while" cost. ``mapper.clear()`` only marks the blocks free,
+        so a per-batch reset costs a hash clear instead of a full re-allocation, and the
+        hash never has to grow back up from empty. (This is the same primitive the VRAM
+        flush path already uses.)"""
+        self.mapper.clear()
+
     def num_tsdf_blocks(self):
         """Number of allocated TSDF blocks (a proxy for nvblox GPU memory use)."""
         try:

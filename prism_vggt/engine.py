@@ -130,10 +130,25 @@ class StreamingWindowEngine:
         self.perc_future = None
         self.tsdf = None
 
+        # Soft reset (default): on a per-batch reset (PRISM_RESET_EACH_BATCH), wipe the
+        # nvblox volume + color cache IN PLACE via mapper.clear() instead of building a
+        # fresh Mapper each batch. Keeps the GPU allocation + block-hash capacity, so the
+        # reset costs a hash clear (~ms) not a CUDA re-allocation (the reset-latency fix).
+        # SOFT_RESET=0 restores the old full-reconstruct-each-batch behaviour.
+        self.soft_reset = os.environ.get("SOFT_RESET", "1") == "1"
+
         print("[Engine] Initializing PRISM-VGGT Engine...")
-        self.reset()
-        
-    def reset(self):
+        self.reset()            # first reset is always a full construct (tsdf is None)
+
+    def reset(self, soft: bool = False):
+        """Reset the map for a fresh reconstruction.
+
+        soft=True + an existing volume ⇒ wipe the nvblox TSDF and color cache IN PLACE
+        (mapper.clear() + colorizer.clear()), reusing the allocated Mapper/hash/pools —
+        the low-latency per-batch reset. Otherwise construct a fresh NvbloxPanoTSDF +
+        BlockColorCache (the first-ever reset, or SOFT_RESET=0). The Python-side state
+        (poses, overlap chain, scale/leveling, submap counters) is reset identically in
+        both paths; the perception cache is deliberately preserved (see __init__)."""
         if self.tsdf_future is not None:
             self.tsdf_future.result()
             self.tsdf_future = None
@@ -144,6 +159,38 @@ class StreamingWindowEngine:
                 pass
             self.perc_future = None
 
+        reuse = bool(soft) and self.tsdf is not None and getattr(self, "colorizer", None) is not None
+        self._reset_state()
+
+        if reuse:
+            # In-place wipe — no Mapper re-alloc, no block-hash regrow. NOTE the color
+            # cache's map_version is NOT reset here, so it keeps climbing monotonically
+            # across soft resets (each fresh batch streams a strictly newer version,
+            # which the whole-snapshot client uses to replace its cloud).
+            self.tsdf.clear()
+            self.colorizer.clear()
+        else:
+            self.tsdf = NvbloxPanoTSDF(
+                voxel_size_m=self.voxel_size,
+                max_depth=self.max_depth,
+                face_size=self.face_size,
+                crop_margin=self.crop_margin,
+                device=self.device
+            )
+            # Block color cache + best-view colorizer + streaming API (see coloring.py).
+            # Built here so per-run config (voxel_size, max_depth, ...) is picked up.
+            self.colorizer = BlockColorCache(
+                voxel_size=self.voxel_size,
+                color_block_mult=self.color_block_mult,
+                max_depth=self.max_depth,
+                device=self.device,
+                cam_batch=self.color_cam_batch,
+                point_chunk=self.color_point_chunk,
+            )
+
+    def _reset_state(self):
+        """Reset all Python-side per-reconstruction state (everything except the GPU
+        Mapper and color cache objects, which reset() decides to reuse or rebuild)."""
         self.last_mesh = None
         self.last_pcd = None
 
@@ -154,14 +201,6 @@ class StreamingWindowEngine:
         self.accum_pcd_cache = o3d.geometry.PointCloud()
         self.last_flush_submap = 0
 
-        self.tsdf = NvbloxPanoTSDF(
-            voxel_size_m=self.voxel_size,
-            max_depth=self.max_depth,
-            face_size=self.face_size,
-            crop_margin=self.crop_margin,
-            device=self.device
-        )
-        
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
         self.trajectory = []
@@ -171,17 +210,6 @@ class StreamingWindowEngine:
         self.pose_timestamps = []      # parallel to full_poses (from FrameInput.timestamp)
         self.processed_indices = []
         self._done_starts = set()      # window-start indices already processed (online mode)
-
-        # Block color cache + best-view colorizer + streaming API (see coloring.py).
-        # Rebuilt here so per-run config (voxel_size, max_depth, ...) is picked up.
-        self.colorizer = BlockColorCache(
-            voxel_size=self.voxel_size,
-            color_block_mult=self.color_block_mult,
-            max_depth=self.max_depth,
-            device=self.device,
-            cam_batch=self.color_cam_batch,
-            point_chunk=self.color_point_chunk,
-        )
 
         self.submap_count = 0
         self.is_first_window = True
@@ -534,7 +562,7 @@ class StreamingWindowEngine:
         # persistent map (the nvblox TSDF, colorizer, poses and overlap-chain all
         # carry over because we don't reset them).
         if reset:
-            self.reset()
+            self.reset(soft=self.soft_reset)
         if generate_esdf is not None:
             self.compute_esdf = bool(generate_esdf)
         parallel = (self.processing_mode == "parallel")
