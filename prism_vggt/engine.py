@@ -136,6 +136,13 @@ class StreamingWindowEngine:
         # reset costs a hash clear (~ms) not a CUDA re-allocation (the reset-latency fix).
         # SOFT_RESET=0 restores the old full-reconstruct-each-batch behaviour.
         self.soft_reset = os.environ.get("SOFT_RESET", "1") == "1"
+        # Reset-mode latency: in a fresh rebuild we only ever stream the FINAL window's
+        # surface, so extracting + colouring the mesh on every intermediate window is
+        # wasted work. When True, intermediate windows only INTEGRATE (build the TSDF);
+        # the mesh is extracted + coloured ONCE on the last window, using ALL of the
+        # batch's keyframes (accumulated below) so nothing goes uncoloured. Only active
+        # when process_sequence(reset=True). SOFT_RESET/online paths are unaffected.
+        self.reset_extract_last_only = os.environ.get("RESET_EXTRACT_LAST_ONLY", "1") == "1"
 
         print("[Engine] Initializing PRISM-VGGT Engine...")
         self.reset()            # first reset is always a full construct (tsdf is None)
@@ -239,6 +246,14 @@ class StreamingWindowEngine:
         self.world_align = np.eye(4)
         self.is_leveled = False
         self.last_floor_plane = None
+
+        # Keyframes integrated so far this reconstruction, accumulated across windows so
+        # the single final extract (reset_extract_last_only) can colour the whole surface
+        # from every view, not just the last window's.
+        self._acc_kf_rgbs = []
+        self._acc_kf_depths = []
+        self._acc_kf_masks = []
+        self._acc_kf_poses = []
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         for j in range(len(poses)):
@@ -889,6 +904,16 @@ class StreamingWindowEngine:
             self.is_first_window = False
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
+            # Extract-only-last (reset mode): defer mesh/colour to the final window and
+            # accumulate this window's keyframes so the final colour pass sees all views.
+            extract_last = bool(reset) and getattr(self, "reset_extract_last_only", False)
+            is_last_window = (i == starts[-1])
+            if extract_last and len(batch_poses) > 0:
+                self._acc_kf_rgbs.extend(batch_rgbs)
+                self._acc_kf_depths.extend(batch_depths)
+                self._acc_kf_masks.extend(batch_masks)
+                self._acc_kf_poses.extend(batch_poses)
+
             t3 = time.time()
             if len(batch_poses) > 0:
                 print(f"  > [TSDF] Sending {len(batch_poses)} Keyframes to C++ Background Mapper...")
@@ -949,8 +974,16 @@ class StreamingWindowEngine:
             # Skip extraction when nothing was integrated this window (fully gated /
             # static): re-coloring with an empty batch would blank the cloud, and
             # re-meshing an unchanged volume just wastes time.
-            do_extract = (len(batch_poses) > 0
-                          and self.submap_count % max(1, int(self.mesh_extract_every)) == 0)
+            if extract_last:
+                # Only extract on the final window; colour from ALL accumulated keyframes.
+                do_extract = is_last_window and len(self._acc_kf_poses) > 0
+                col_rgbs, col_depths = self._acc_kf_rgbs, self._acc_kf_depths
+                col_masks, col_poses = self._acc_kf_masks, self._acc_kf_poses
+            else:
+                do_extract = (len(batch_poses) > 0
+                              and self.submap_count % max(1, int(self.mesh_extract_every)) == 0)
+                col_rgbs, col_depths = batch_rgbs, batch_depths
+                col_masks, col_poses = batch_masks, batch_poses
             if do_extract:
                 # Marching cubes is incremental in nvblox and shared by both paths.
                 t0 = time.time()
@@ -983,7 +1016,7 @@ class StreamingWindowEngine:
 
                     t_color = time.time()
                     colors_np = self.colorizer.color_vertices(
-                        v_np, n_np, batch_rgbs, batch_depths, batch_masks, batch_poses
+                        v_np, n_np, col_rgbs, col_depths, col_masks, col_poses
                     )
                     profiler["Coloring"] = time.time() - t_color
 
@@ -1021,7 +1054,7 @@ class StreamingWindowEngine:
 
                     t_color = time.time()
                     self.last_mesh = self._color_geometry(
-                        current_geometry, batch_rgbs, batch_depths, batch_masks, batch_poses
+                        current_geometry, col_rgbs, col_depths, col_masks, col_poses
                     )
                     profiler["Coloring"] = time.time() - t_color
 
