@@ -812,6 +812,38 @@ class StreamingWindowEngine:
 
             global_poses = [_to_world(cn) for cn in canonical_native]
 
+            # ── Flip guard (gravity/orientation stability) ─────────────────────
+            # The overlap frames are the SAME physical cameras as the previous window,
+            # so their WORLD orientation must be continuous. The Sim3 anchor is fit
+            # mainly from camera CENTRES, which are 90/180-ambiguous in feature-rich or
+            # symmetric scenes — VGGT then locks onto a flipped rotation and the whole
+            # map + robot avatar tip over (ceiling-down / on-its-side). Detect the jump
+            # from the overlap cameras' orientation and rotate the anchor back so the
+            # world can never flip. Disable with PRISM_FLIP_GUARD=0.
+            if (not self.is_first_window
+                    and os.environ.get("PRISM_FLIP_GUARD", "1") == "1"
+                    and len(self.prev_overlap_global_poses) == self.overlap):
+                Racc = np.zeros((3, 3))
+                for oi in range(self.overlap):
+                    Racc += (self.prev_overlap_global_poses[oi][:3, :3]
+                             @ global_poses[oi][:3, :3].T)
+                U, _, Vt = np.linalg.svd(Racc)
+                R_fix = U @ Vt
+                if np.linalg.det(R_fix) < 0.0:
+                    U[:, -1] *= -1.0
+                    R_fix = U @ Vt
+                flip_deg = float(np.degrees(np.arccos(
+                    np.clip((np.trace(R_fix) - 1.0) / 2.0, -1.0, 1.0))))
+                gate = float(os.environ.get("PRISM_FLIP_GATE_DEG", "35"))
+                if flip_deg > gate:
+                    R_anchor = R_fix @ R_anchor
+                    Ua, _, Vta = np.linalg.svd(R_anchor)      # re-orthonormalize
+                    R_anchor = Ua @ Vta
+                    t_anchor = tgt_ctr - s_anchor * (R_anchor @ src_ctr)
+                    global_poses = [_to_world(cn) for cn in canonical_native]
+                    print(f"  > [FlipGuard] corrected {flip_deg:.0f} deg world-frame "
+                          f"flip (overlap-orientation lock)")
+
             # ── Overlap pose pinning (online drift fix) ────────────────────────
             # In online mode (reset=False), each window's VGGT inference produces
             # slightly different predictions for the shared overlap frames. The
