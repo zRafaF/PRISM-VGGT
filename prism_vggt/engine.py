@@ -619,6 +619,23 @@ class StreamingWindowEngine:
             window_heights = [f.camera_height for f in window]
             window_timestamps = [f.timestamp for f in window]
 
+            # ── Still-frame guard ──────────────────────────────────────────────
+            # Zero camera motion => no parallax => VGGT's near-ground depth is
+            # degenerate, and integrating it CARVES holes (the 'square gap' around a
+            # parked robot). Detect stillness from IMAGE content (robust to VGGT's
+            # per-frame pose jitter, which fools the motion-based keyframe gate) and
+            # skip TSDF integration for still windows. Disable with PRISM_STILL_GUARD=0.
+            is_still = False
+            if os.environ.get("PRISM_STILL_GUARD", "1") == "1" and len(window_frames) >= 2:
+                try:
+                    _a = np.asarray(window_frames[0], dtype=np.float32)
+                    _b = np.asarray(window_frames[-1], dtype=np.float32)
+                    if _a.shape == _b.shape:
+                        _pd = float(np.mean(np.abs(_a[::8, ::8] - _b[::8, ::8])))
+                        is_still = _pd < float(os.environ.get("PRISM_STILL_PIXDIFF", "2.0"))
+                except Exception:
+                    is_still = False
+
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
 
@@ -844,6 +861,25 @@ class StreamingWindowEngine:
                     print(f"  > [FlipGuard] corrected {flip_deg:.0f} deg world-frame "
                           f"flip (overlap-orientation lock)")
 
+            # ── Vertical drift guard (Z re-level) ──────────────────────────────
+            # Gently re-level the anchor so the detected floor stays at world Z=0 each
+            # submap, countering the slow per-submap floor CLIMB (t_z creep) that makes
+            # the robot appear to sink into the map over time. Small gain so a noisy
+            # floor estimate can't jitter the map. Disable with PRISM_Z_RELEVEL=0.
+            if (not self.is_first_window
+                    and os.environ.get("PRISM_Z_RELEVEL", "1") == "1"
+                    and floor_plane is not None
+                    and floor_conf >= self.level_min_confidence):
+                _c_metric = floor_plane["centroid"] * self.current_metric_scale
+                _floor_z = float((global_poses[mid_idx] @ np.append(_c_metric, 1.0))[2])
+                _gain = float(os.environ.get("PRISM_Z_RELEVEL_GAIN", "0.1"))
+                _dz = -_gain * _floor_z
+                if abs(_dz) > 1e-5:
+                    t_anchor[2] += _dz
+                    global_poses = [_to_world(cn) for cn in canonical_native]
+                    if abs(_floor_z) > 0.02:
+                        print(f"  > [ZReLevel] floor {_floor_z:+.3f}m -> nudge {_dz:+.3f}m")
+
             # ── Overlap pose pinning (online drift fix) ────────────────────────
             # In online mode (reset=False), each window's VGGT inference produces
             # slightly different predictions for the shared overlap frames. The
@@ -932,7 +968,7 @@ class StreamingWindowEngine:
                     # Integrate only if the camera moved enough vs the last keyframe.
                     # Pose bookkeeping above stays unconditional so the trajectory and
                     # pose-correction chain are intact even on skipped frames.
-                    if self._keyframe_accept(global_pose, window_timestamps[j]):
+                    if (not is_still) and self._keyframe_accept(global_pose, window_timestamps[j]):
                         tsdf_pose = global_pose.copy()
 
                         # Cubemap upside-down guard. The camera's down axis (col 1,
