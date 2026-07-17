@@ -218,18 +218,21 @@ class StreamingWindowEngine:
         # --- Submap ALIGNMENT GROUP (ablation knob) --------------------------
         # How each new submap is registered into the world, read fresh each reset so
         # a per-run env var takes effect:
-        #   "sim3" (default) — 7-DoF similarity (rot + trans + one scale). PRISM.
-        #   "se3"            — 6-DoF rigid (rot + trans) at the LOCKED metric scale.
-        #   "sl4"            — 15-DoF projective homography fit from the DENSE overlap
+        #   "sl4" (default) — 15-DoF projective homography fit from the DENSE overlap
         #                      point maps (VGGT-SLAM's group). Integrated at its local
         #                      similarity (nvblox is rigid); the discarded shear/
         #                      perspective is reported as the non-similarity distortion.
-        self.align_mode = os.environ.get("PRISM_ALIGN", "sim3").lower()
+        #                      Chosen as default: best reconstruction on the preliminary
+        #                      benchmark (F 0.66 vs 0.60 for sim3); floor grounding keeps
+        #                      it metric. Set PRISM_ALIGN=sim3 for the metric-by-
+        #                      construction 7-DoF variant, or se3 for 6-DoF rigid.
+        #   "sim3"           — 7-DoF similarity (rot + trans + one scale).
+        #   "se3"            — 6-DoF rigid (rot + trans) at the LOCKED metric scale.
+        self.align_mode = os.environ.get("PRISM_ALIGN", "sl4").lower()
         self._H_current = None
         self.align_stats = {"nonsim_pct": []}
-        if self.align_mode != "sim3":
-            print(f"[Engine] Submap alignment group = {self.align_mode.upper()} "
-                  f"(ablation; default is sim3)")
+        print(f"[Engine] Submap alignment group = {self.align_mode.upper()} "
+              f"(default sl4; PRISM_ALIGN=sim3|se3 for the ablation variants)")
 
         self.trajectory = []
         self.full_poses = []
