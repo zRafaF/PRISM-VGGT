@@ -14,7 +14,10 @@ from .perception_base import BasePerceptionExtractor
 from .frames import FrameInput, WorldFrame, ProcessingMode
 from .coloring import BlockColorCache
 
-from .utils.geometry import register_camera_poses_sim3, rotation_aligning_vectors
+from .utils.geometry import (
+    register_camera_poses_sim3, register_camera_poses_kabsch, rotation_aligning_vectors,
+    register_points_sl4, apply_sl4, sl4_local_sim3, sl4_nonsimilarity_report,
+)
 from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
@@ -210,6 +213,24 @@ class StreamingWindowEngine:
 
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
+        self.prev_overlap_world_pts = []   # dense tail world pts (SL4 fit source)
+
+        # --- Submap ALIGNMENT GROUP (ablation knob) --------------------------
+        # How each new submap is registered into the world, read fresh each reset so
+        # a per-run env var takes effect:
+        #   "sim3" (default) — 7-DoF similarity (rot + trans + one scale). PRISM.
+        #   "se3"            — 6-DoF rigid (rot + trans) at the LOCKED metric scale.
+        #   "sl4"            — 15-DoF projective homography fit from the DENSE overlap
+        #                      point maps (VGGT-SLAM's group). Integrated at its local
+        #                      similarity (nvblox is rigid); the discarded shear/
+        #                      perspective is reported as the non-similarity distortion.
+        self.align_mode = os.environ.get("PRISM_ALIGN", "sim3").lower()
+        self._H_current = None
+        self.align_stats = {"nonsim_pct": []}
+        if self.align_mode != "sim3":
+            print(f"[Engine] Submap alignment group = {self.align_mode.upper()} "
+                  f"(ablation; default is sim3)")
+
         self.trajectory = []
         self.full_poses = []
         self._last_kf_pose = None        # keyframe-gating: last integrated camera pose
@@ -451,6 +472,32 @@ class StreamingWindowEngine:
             return float("inf")
         free, _ = torch.cuda.mem_get_info()
         return free / (1024 ** 3)
+
+    def _fit_sl4_from_overlap(self, canonical_native, pts_list):
+        """Fit the 15-DoF SL(4) homography (native-world -> world) from the DENSE,
+        pixel-corresponded overlap point maps: the current window's first ``overlap``
+        frames vs the previous window's cached tail world points (same physical
+        frames). Returns H or None (caller falls back to Sim3). This is the honest
+        analog of VGGT-SLAM's dense projective submap alignment — many points, so all
+        15 DoF are well constrained (fitting from ~4 camera centres would not be)."""
+        prev = self.prev_overlap_world_pts
+        if not prev or len(prev) != self.overlap:
+            return None
+        src_list, tgt_list = [], []
+        for k in range(self.overlap):
+            cur = np.asarray(pts_list[k]).reshape(-1, 3)
+            tw = np.asarray(prev[k]).reshape(-1, 3)
+            n = min(len(cur), len(tw))
+            if n == 0:
+                continue
+            cn = canonical_native[k]
+            src_w = (cur[:n] @ cn[:3, :3].T) + cn[:3, 3]      # native-world
+            src_list.append(src_w)
+            tgt_list.append(tw[:n])                            # world (meters)
+        if not src_list:
+            return None
+        return register_points_sl4(np.concatenate(src_list, axis=0),
+                                   np.concatenate(tgt_list, axis=0))
 
     def _color_geometry(self, geometry, rgbs=None, depths=None, masks=None, poses=None):
         """Colorize an already-extracted volume mesh in place (vertices = point
@@ -806,6 +853,31 @@ class StreamingWindowEngine:
                 # Keep translation consistent with the (locked or estimated) scale.
                 t_anchor = tgt_ctr - s_anchor * (R_anchor @ src_ctr)
 
+                # ── Alignment-group ABLATION (PRISM_ALIGN) ────────────────────
+                # Default 'sim3' uses the joint 7-DoF similarity computed above.
+                # 'se3' drops the per-overlap scale → 6-DoF rigid placement at the
+                # locked metric scale. 'sl4' fits the full 15-DoF projective homography
+                # from the DENSE overlap point maps (VGGT-SLAM's group); _to_world then
+                # places poses through the exact homography, integrating at its local
+                # similarity. The Sim3 (s_anchor,R_anchor,t_anchor) is kept as the guard
+                # base + fallback.
+                self._H_current = None
+                if self.align_mode == "se3":
+                    R_anchor, t_anchor = register_camera_poses_kabsch(
+                        src_cam_np, tgt_cam_np, scale=s_anchor)
+                elif self.align_mode == "sl4":
+                    H_sl4 = self._fit_sl4_from_overlap(canonical_native, pts_list)
+                    if H_sl4 is not None:
+                        self._H_current = H_sl4
+                        rep = sl4_nonsimilarity_report(
+                            H_sl4, at=canonical_native[mid_idx][:3, 3])
+                        self.align_stats["nonsim_pct"].append(rep["nonsimilarity_pct"])
+                        print(f"  > [SL4] non-similarity {rep['nonsimilarity_pct']:.1f}% "
+                              f"(anisotropy {rep['anisotropy']:.3f}, "
+                              f"perspective {rep['perspective']:.3e})")
+                    else:
+                        print("  > [SL4] overlap fit degenerate — Sim3 fallback this submap")
+
             self.current_metric_scale = s_anchor
 
             # ── per-submap anchor diagnostics ───────────────────────────────
@@ -823,6 +895,14 @@ class StreamingWindowEngine:
 
             def _to_world(cn):
                 gp = np.eye(4)
+                if self.align_mode == "sl4" and self._H_current is not None:
+                    # Place the camera centre through the EXACT homography; take the
+                    # orientation from its local rotation (polar of the Jacobian).
+                    c_native = cn[:3, 3]
+                    gp[:3, 3] = apply_sl4(self._H_current, c_native)
+                    _sl, R_loc = sl4_local_sim3(self._H_current, c_native)
+                    gp[:3, :3] = R_loc @ cn[:3, :3]
+                    return gp
                 gp[:3, :3] = R_anchor @ cn[:3, :3]
                 gp[:3, 3] = s_anchor * (R_anchor @ cn[:3, 3]) + t_anchor
                 return gp
@@ -857,6 +937,11 @@ class StreamingWindowEngine:
                     Ua, _, Vta = np.linalg.svd(R_anchor)      # re-orthonormalize
                     R_anchor = Ua @ Vta
                     t_anchor = tgt_ctr - s_anchor * (R_anchor @ src_ctr)
+                    if self.align_mode == "sl4" and self._H_current is not None:
+                        # A rigid world-space pre-rotation composes with a homography by
+                        # left-multiplication (its last row is [0,0,0,1]).
+                        Tfix = np.eye(4); Tfix[:3, :3] = R_fix
+                        self._H_current = Tfix @ self._H_current
                     global_poses = [_to_world(cn) for cn in canonical_native]
                     print(f"  > [FlipGuard] corrected {flip_deg:.0f} deg world-frame "
                           f"flip (overlap-orientation lock)")
@@ -876,6 +961,9 @@ class StreamingWindowEngine:
                 _dz = -_gain * _floor_z
                 if abs(_dz) > 1e-5:
                     t_anchor[2] += _dz
+                    if self.align_mode == "sl4" and self._H_current is not None:
+                        Tdz = np.eye(4); Tdz[2, 3] = _dz
+                        self._H_current = Tdz @ self._H_current
                     global_poses = [_to_world(cn) for cn in canonical_native]
                     if abs(_floor_z) > 0.02:
                         print(f"  > [ZReLevel] floor {_floor_z:+.3f}m -> nudge {_dz:+.3f}m")
@@ -977,7 +1065,15 @@ class StreamingWindowEngine:
                         if tsdf_pose[2, 1] > 0:
                             tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
 
-                        scaled_pts = pts_list[j] * depth_scale
+                        # Under SL(4) the native->world map is projective, so its
+                        # LOCAL scale varies per camera; integrate each frame's depth at
+                        # that local scale (the isotropic part of the warp). Sim3/SE3 use
+                        # the single committed scale.
+                        frame_scale = depth_scale
+                        if self.align_mode == "sl4" and self._H_current is not None:
+                            frame_scale = sl4_local_sim3(
+                                self._H_current, canonical_native[j][:3, 3])[0]
+                        scaled_pts = pts_list[j] * frame_scale
                         depth_map = np.nan_to_num(np.linalg.norm(scaled_pts, axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
 
                         batch_depths.append(depth_map)
@@ -998,6 +1094,19 @@ class StreamingWindowEngine:
                     self.prev_overlap_global_poses.append(global_pose)
             
             self.prev_overlap_raw_pts = pts_list[-self.overlap:]
+            # For the SL(4) arm, cache the tail overlap frames' WORLD points (at the
+            # scale they were integrated) so the NEXT window can fit its homography from
+            # dense metric correspondences. Only built for sl4 (sim3/se3 pay nothing).
+            if self.align_mode == "sl4":
+                self.prev_overlap_world_pts = []
+                for oj in range(self.window_size - self.overlap, self.window_size):
+                    if self._H_current is not None:
+                        ws = sl4_local_sim3(self._H_current, canonical_native[oj][:3, 3])[0]
+                    else:
+                        ws = self.current_metric_scale
+                    P = np.asarray(pts_list[oj]).reshape(-1, 3) * ws
+                    gp = global_poses[oj]
+                    self.prev_overlap_world_pts.append((P @ gp[:3, :3].T) + gp[:3, 3])
             self.is_first_window = False
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 

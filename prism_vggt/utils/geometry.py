@@ -153,3 +153,140 @@ def register_camera_poses_sim3(src_cam_poses: np.ndarray, tgt_cam_poses: np.ndar
     t = tgt_centroid - s * (R @ src_centroid)
 
     return s, R, t, src_centroid, tgt_centroid
+
+
+# ======================================================================
+# SL(4) / PGL(4) projective alignment  — the 15-DoF ABLATION arm
+# ----------------------------------------------------------------------
+# PRISM aligns submaps with a 7-DoF Sim(3) (rotation + translation + one
+# global scale). VGGT-SLAM instead aligns them with a 15-DoF SL(4)/PGL(4)
+# projective transform, which on top of rotation/translation/scale also
+# permits ANISOTROPIC scaling, SHEAR and PERSPECTIVE warp. These helpers
+# fit and apply such a transform so the alignment group can be ablated in
+# isolation (everything else in the engine held fixed). The extra 8 DoF fit
+# the overlap better but distort metric geometry — which is exactly what we
+# measure. See sl4_nonsimilarity_report for the distortion diagnostic.
+# ======================================================================
+
+def _hartley_normalize_3d(pts: np.ndarray):
+    """Isotropic (Hartley) normalization: centre at origin, mean distance sqrt(3).
+    Returns the 4x4 normalizing transform T and the normalized points."""
+    c = pts.mean(axis=0)
+    d = pts - c
+    mean_dist = float(np.sqrt((d ** 2).sum(axis=1)).mean())
+    s = (np.sqrt(3.0) / mean_dist) if mean_dist > 1e-12 else 1.0
+    T = np.eye(4)
+    T[:3, :3] *= s
+    T[:3, 3] = -s * c
+    return T, d * s
+
+
+def register_points_sl4(src: np.ndarray, tgt: np.ndarray, max_pts: int = 3000,
+                        seed: int = 0):
+    """Fit a 3D projective homography H (4x4, |det|=1) mapping ``src`` -> ``tgt``
+    point-wise via the Direct Linear Transform — the 15-DoF SL(4)/PGL(4) analog of
+    VGGT-SLAM's submap alignment.
+
+    ``src``/``tgt`` are (N,3) *corresponded* points (same physical surface, one from
+    each overlapping submap). Hartley-normalized for conditioning; returns H (native
+    -> world), or ``None`` if the correspondence set is degenerate.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    tgt = np.asarray(tgt, dtype=np.float64)
+    if src.shape != tgt.shape or src.ndim != 2 or src.shape[1] != 3 or len(src) < 5:
+        return None
+    fin = np.isfinite(src).all(1) & np.isfinite(tgt).all(1)
+    src, tgt = src[fin], tgt[fin]
+    if len(src) < 5:
+        return None
+    if len(src) > max_pts:
+        idx = np.random.default_rng(seed).choice(len(src), max_pts, replace=False)
+        src, tgt = src[idx], tgt[idx]
+
+    Ts, sn = _hartley_normalize_3d(src)
+    Tt, tn = _hartley_normalize_3d(tgt)
+    N = len(sn)
+    Xh = np.concatenate([sn, np.ones((N, 1))], axis=1)          # (N,4)
+
+    # DLT: for each point, 3 rows enforcing (row_a . X) - x'_a (row_3 . X) = 0.
+    A = np.zeros((3 * N, 16))
+    r = 0
+    for p in range(N):
+        X = Xh[p]
+        xp = tn[p]                       # (3,), homogeneous w' = 1
+        for a in range(3):
+            row = np.zeros(16)
+            row[a * 4:(a + 1) * 4] = X            # (row_a . X) * w'
+            row[12:16] -= xp[a] * X               # - x'_a (row_3 . X)
+            A[r] = row
+            r += 1
+
+    try:
+        _, _, Vt = np.linalg.svd(A, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    Hn = Vt[-1].reshape(4, 4)
+    H = np.linalg.inv(Tt) @ Hn @ Ts                # denormalize
+    d = np.linalg.det(H)
+    if not np.isfinite(d) or abs(d) < 1e-30:
+        return None
+    return H / (abs(d) ** 0.25)                    # |det| -> 1
+
+
+def apply_sl4(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Apply a 4x4 projective transform to 3D point(s) with the perspective divide."""
+    pts = np.asarray(pts, dtype=np.float64)
+    single = pts.ndim == 1
+    P = pts.reshape(-1, 3)
+    Ph = np.concatenate([P, np.ones((len(P), 1))], axis=1)
+    Y = Ph @ H.T
+    w = Y[:, 3:4]
+    w = np.where(np.abs(w) < 1e-12, 1e-12, w)
+    out = Y[:, :3] / w
+    return out[0] if single else out
+
+
+def sl4_local_sim3(H: np.ndarray, p: np.ndarray):
+    """Best-fit local similarity (scale s, rotation R) of the projective map ``H`` at
+    point ``p``, via the polar decomposition of its Jacobian. Used to integrate a
+    submap into the (rigid) TSDF: nvblox cannot represent shear/perspective, so we
+    integrate at the local rigid+scale approximation and report the discarded
+    non-rigid part separately (sl4_nonsimilarity_report)."""
+    p = np.asarray(p, dtype=np.float64)
+    xh = np.append(p, 1.0)
+    num = H[:3, :] @ xh                              # (3,)
+    w = float(H[3, :] @ xh)
+    if abs(w) < 1e-12:
+        w = 1e-12
+    J = (H[:3, :3] * w - np.outer(num, H[3, :3])) / (w * w)
+    U, S, Vt = np.linalg.svd(J)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U = U.copy(); U[:, -1] *= -1.0
+        R = U @ Vt
+    s = float(np.cbrt(max(S[0] * S[1] * S[2], 1e-30)))
+    return s, R
+
+
+def sl4_nonsimilarity_report(H: np.ndarray, at: np.ndarray = None) -> dict:
+    """Quantify how far ``H`` departs from a pure similarity at point ``at`` — the
+    exact freedom Sim(3) forbids and VGGT-SLAM's SL(4) permits.
+
+    Returns anisotropy (max/min local stretch - 1; 0 for a similarity), a shear
+    proxy (dispersion of the Jacobian's singular values), the perspective row
+    magnitude, and ``nonsimilarity_pct`` = 100 * anisotropy for reporting.
+    """
+    at = np.zeros(3) if at is None else np.asarray(at, dtype=np.float64)
+    xh = np.append(at, 1.0)
+    num = H[:3, :] @ xh
+    w = float(H[3, :] @ xh)
+    if abs(w) < 1e-12:
+        w = 1e-12
+    J = (H[:3, :3] * w - np.outer(num, H[3, :3])) / (w * w)
+    S = np.linalg.svd(J, compute_uv=False)
+    s = float(np.cbrt(max(S[0] * S[1] * S[2], 1e-30)))
+    anisotropy = float(S[0] / max(S[2], 1e-12) - 1.0)
+    shear = float(np.std(S) / (np.mean(S) + 1e-12))
+    perspective = float(np.linalg.norm(H[3, :3]) / (abs(H[3, 3]) + 1e-12))
+    return {"local_scale": s, "anisotropy": anisotropy, "shear": shear,
+            "perspective": perspective, "nonsimilarity_pct": 100.0 * anisotropy}
