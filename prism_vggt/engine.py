@@ -833,9 +833,22 @@ class StreamingWindowEngine:
                         print(f"  > [Scale Lock] committed median s={s_anchor:.4f} "
                               f"over {len(self.floor_scale_samples)} windows")
                     else:
+                        # floor_scale is None whenever THIS window saw no confident
+                        # floor (estimate_metric_scale_from_floor returns (None, conf,
+                        # None) in 4 branches). The sample-append above is guarded, and
+                        # s_anchor correctly falls back to the median of earlier
+                        # samples -- but this diagnostic string was not guarded, so
+                        # formatting None with :.4f raised TypeError and killed the
+                        # whole run from a LOG LINE. Reaching it needs: scale not yet
+                        # committed, >=1 sample already collected, and no floor this
+                        # window -- which is why it only bites mid-sequence on longer
+                        # runs, and is the most likely cause of the 43 zero-output
+                        # PRISM runs in the 2026-07 matrix.
+                        _fs = ("n/a (no floor this window)" if floor_scale is None
+                               else f"{floor_scale:.4f}")
                         print(f"  > [Scale Warmup] {len(self.floor_scale_samples)}/"
                               f"{self.scale_warmup_windows}: median s={s_anchor:.4f} "
-                              f"(this floor s={floor_scale:.4f})")
+                              f"(this floor s={_fs})")
                 elif os.environ.get("LOCK_SCALE_AFTER_FIRST", "1") == "1":
                     # Committed: every later window REUSES the locked scale and estimates
                     # only rotation+translation from the overlap. Leaving the overlap
