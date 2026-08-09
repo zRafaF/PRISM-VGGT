@@ -644,7 +644,19 @@ class StreamingWindowEngine:
         num_frames = len(frames)
         t_seq_start = time.time()
 
-        all_starts = range(0, num_frames - self.window_size + 1, self.window_size - self.overlap)
+        # Window starts. NOTE the upper bound: `num_frames - window_size + 1` would
+        # drop any window that runs past the end of the sequence, silently discarding
+        # the tail of every sequence whose length is not start-aligned. For
+        # (n=20, ws=16, ov=4) it yielded starts=[0] and frames 16..19 were never
+        # posed or integrated; for n=200 it dropped the last 4. The dropped count is
+        # (n - window_size) % (window_size - overlap), up to window_size-overlap-1.
+        # Bounding by `num_frames - overlap` instead matches the benchmark's own
+        # sliding_windows() and guarantees the tail window still carries at least
+        # overlap+1 frames, so Sim3/SL4 registration against the previous window is
+        # never starved. The tail window is SHORTER than window_size, so everything
+        # below indexes with win_len (the actual length) rather than self.window_size.
+        step = self.window_size - self.overlap
+        all_starts = range(0, max(1, num_frames - self.overlap), step)
         starts = [i for i in all_starts if i not in self._done_starts]   # only NEW windows
 
         # Prime the pipeline: launch the first window's inference in the background so
@@ -664,6 +676,7 @@ class StreamingWindowEngine:
             profiler = {}
 
             window = frames[i : i + self.window_size]
+            win_len = len(window)          # < self.window_size only for the tail window
             window_frames = [f.image for f in window]
             window_masks = [f.mask for f in window]
             window_heights = [f.camera_height for f in window]
@@ -723,7 +736,7 @@ class StreamingWindowEngine:
             pts_list, poses = preds["points"], preds["poses"]
             
             t2 = time.time()
-            mid_idx = self.window_size // 2
+            mid_idx = win_len // 2
 
             # Use raw unscaled points for RANSAC Metrification. The metric target is
             # this window's per-frame camera height (instantaneous measurement).
@@ -749,9 +762,9 @@ class StreamingWindowEngine:
                 # the MEDIAN floor scale across several frames of this first window
                 # (one-time cost) rather than the mid frame alone.
                 first_scales = []
-                for fi in sorted(set([0, mid_idx, self.window_size // 4,
-                                      3 * self.window_size // 4, self.window_size - 1])):
-                    if 0 <= fi < self.window_size:
+                for fi in sorted(set([0, mid_idx, win_len // 4,
+                                      3 * win_len // 4, win_len - 1])):
+                    if 0 <= fi < win_len:
                         fs, fc, _fp = estimate_metric_scale_from_floor(
                             pts_list[fi], target_camera_height=window_heights[fi])
                         if fs is not None and fc >= self.level_min_confidence:
@@ -1041,7 +1054,7 @@ class StreamingWindowEngine:
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             start_idx = 0 if self.is_first_window else self.overlap
 
-            for j in range(self.window_size):
+            for j in range(win_len):
                 global_pose = global_poses[j]
 
                 if j >= start_idx:
@@ -1086,8 +1099,8 @@ class StreamingWindowEngine:
                         self._last_kf_pose = global_pose.copy()
                         self._last_kf_t = window_timestamps[j]
 
-                if j >= self.window_size - self.overlap:
-                    if j == self.window_size - self.overlap:
+                if j >= win_len - self.overlap:
+                    if j == win_len - self.overlap:
                         self.prev_overlap_global_poses = []
                     # Save the Sim3-computed (NOT pinned) global pose for the tail
                     # overlap frames. These are computed from _to_world() on the
@@ -1102,7 +1115,7 @@ class StreamingWindowEngine:
             # dense metric correspondences. Only built for sl4 (sim3/se3 pay nothing).
             if self.align_mode == "sl4":
                 self.prev_overlap_world_pts = []
-                for oj in range(self.window_size - self.overlap, self.window_size):
+                for oj in range(win_len - self.overlap, win_len):
                     if self._H_current is not None:
                         ws = sl4_local_sim3(self._H_current, canonical_native[oj][:3, 3])[0]
                     else:
@@ -1328,7 +1341,8 @@ class StreamingWindowEngine:
                           f"{free_now:.1f} GB free - risk of a transient-spike OOM. "
                           f"Lower max_depth/voxel or set processing_mode='sequential'.")
             self.submap_count += 1
-            self._done_starts.add(i)
+            if win_len == self.window_size:
+                self._done_starts.add(i)   # partial tail windows re-run when extended
 
             yield display_mesh, display_pcd, np.array(self.trajectory), self.last_floor_plane
 
