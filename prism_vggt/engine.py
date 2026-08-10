@@ -320,8 +320,18 @@ class StreamingWindowEngine:
         #    tell you which way is up is not necessarily good enough to set metric size.
         self.scale_warmup_max_windows = int(os.environ.get("SCALE_WARMUP_MAX_WINDOWS", "8"))
         self.scale_lock_max_spread = float(os.environ.get("SCALE_LOCK_MAX_SPREAD", "0.15"))
+        # 0.40, NOT the 0.50 first tried. Measured over the 244 windows of the
+        # 2026-08-09 matrix: floor_conf clears 0.40 in 61% of windows but 0.50 in only
+        # 16%. At 0.50 a run needs ~19 windows to collect 3 samples, so the scale stayed
+        # frozen at window 1's provisional value (often the median-depth FALLBACK, not a
+        # floor measurement at all) for most of the sequence — strictly worse than the
+        # running median it replaced, and a likely cause of the collapses that appeared
+        # after this change. The apartment_1 failure was never about low confidence: its
+        # samples were 0.4649 and 0.7272, i.e. they DISAGREED by 56% and the code
+        # committed their median anyway. The consistency gate below is the fix for that;
+        # raising the confidence bar was a redundant change that did harm.
         self.scale_lock_min_confidence = float(
-            os.environ.get("SCALE_LOCK_MIN_CONF", "0.50"))
+            os.environ.get("SCALE_LOCK_MIN_CONF", "0.40"))
         # Windows integrated BEFORE the lock kept their provisional scale forever —
         # nothing ever went back and resized them — so a map could contain slabs at two
         # different sizes (visible as duplicated, offset floors in the apartment_1
@@ -332,6 +342,7 @@ class StreamingWindowEngine:
         self._pending_batches = []      # [(depths, rgbs, masks, poses)]
         self._pending_frames = 0
         self._integrated_any = False    # has anything reached the TSDF yet?
+        self._scale_lock_forced = False  # committed at the buffer limit, not by agreement
         self._provisional_scale = None  # ONE scale for every pre-lock window
         self.scale_buffer_max_windows = int(
             os.environ.get("SCALE_BUFFER_MAX_WINDOWS", "6"))
@@ -1177,21 +1188,40 @@ class StreamingWindowEngine:
                 _c_metric = floor_plane["centroid"] * self.current_metric_scale
                 _floor_z = float((global_poses[mid_idx] @ np.append(_c_metric, 1.0))[2])
                 _gain = float(os.environ.get("PRISM_Z_RELEVEL_GAIN", "0.1"))
-                # SANITY CLAMP. This nudge assumes the detected plane IS the floor, and
-                # the floor is by construction near world Z=0. A plane reported 3.2 m
-                # above Z=0 is a ceiling or a tabletop, not a floor — on apartment_1 the
-                # 2026-08-09 run took floors at +3.17 m, +3.27 m and +2.03 m and shifted
-                # whole windows vertically by up to 0.32 m each, which is a large part of
-                # why that map came out as stacked, offset slabs. Beyond this distance we
-                # do not believe the detection and leave the anchor alone.
-                _max_off = float(os.environ.get("PRISM_Z_RELEVEL_MAX_M", "0.5"))
-                if abs(_floor_z) > _max_off:
-                    print(f"  > [ZReLevel] REJECTED: plane at {_floor_z:+.3f}m is "
-                          f"> {_max_off:.2f}m from Z=0 (conf={floor_conf:.2f}) — not a "
-                          f"floor; leaving the anchor unchanged")
+                # IS THIS PLANE ACTUALLY THE FLOOR?
+                #
+                # The first version of this guard rejected the nudge whenever the plane was
+                # more than 0.5 m from world Z=0. That was wrong twice over. Measured on
+                # the 2026-08-09 run: 32% of the corrections the engine used to apply had
+                # |offset| > 0.5 m and 24% > 1.0 m — so the clamp switched OFF vertical
+                # correction in a third of cases, and precisely the third where the map had
+                # drifted furthest. Sequences are now 300-748 frames rather than 47-207,
+                # giving that uncorrected drift three to five times as long to accumulate.
+                #
+                # A large offset does not tell you the plane is wrong; it tells you either
+                # the plane is wrong OR the map has drifted, and those need opposite
+                # responses. What distinguishes them is the plane's distance BELOW THE
+                # CAMERA, which is known independently (the robot's camera height, fed in
+                # per frame). Real drift moves camera and floor together and leaves that
+                # distance intact; a ceiling or a tabletop does not. On apartment_1 the
+                # rejected planes sat at +3.17 m with the camera at ~1.7 m — an apparent
+                # camera height near zero or negative, which is a ceiling, and this test
+                # catches it without touching the genuine-drift case.
+                _cam_z = float(global_poses[mid_idx][2, 3])
+                _h_app = _cam_z - _floor_z          # apparent camera height above it
+                _h_exp = float(window_heights[mid_idx])
+                _h_tol = float(os.environ.get("PRISM_Z_RELEVEL_H_TOL_M", "0.60"))
+                if abs(_h_app - _h_exp) > _h_tol:
+                    print(f"  > [ZReLevel] REJECTED: plane sits {_h_app:+.2f}m below the "
+                          f"camera, expected {_h_exp:.2f}m (+-{_h_tol:.2f}) "
+                          f"(conf={floor_conf:.2f}) — that is not the floor; anchor "
+                          f"unchanged")
                     _dz = 0.0
                 else:
-                    _dz = -_gain * _floor_z
+                    # Genuine vertical drift: correct it, gently, and cap the per-window
+                    # step so one noisy estimate cannot jump the map.
+                    _max_step = float(os.environ.get("PRISM_Z_RELEVEL_MAX_STEP_M", "0.15"))
+                    _dz = float(np.clip(-_gain * _floor_z, -_max_step, _max_step))
                 if abs(_dz) > 1e-5:
                     t_anchor[2] += _dz
                     if self.align_mode == "sl4" and self._H_current is not None:
@@ -1370,6 +1400,25 @@ class StreamingWindowEngine:
             # Cost: the map appears after the lock instead of after window 1 (a startup
             # latency of at most scale_buffer_max_windows windows). That is a real,
             # reportable property of the deployed engine, not a benchmark artifact.
+            # If the buffer is full and the scale still has not met the lock criteria,
+            # COMMIT the provisional scale rather than starting to stream at it and
+            # locking to something else later. A later lock would resize only the windows
+            # after it, leaving the map holding the same room at two sizes — a sharp step
+            # discontinuity, which is visually far worse than the gradual drift this whole
+            # mechanism replaced, and exactly the artifact it exists to prevent. A map at
+            # one possibly-wrong scale is interpretable and its error is measurable
+            # (metric_scale_error_pct); a map at two scales is garbage.
+            if (self.scale_buffer_enabled and not self._scale_committed
+                    and len(self._pending_batches) >= self.scale_buffer_max_windows):
+                self._scale_committed = True
+                self._scale_lock_forced = True
+                print(f"  > [Scale Lock] FORCED at the buffer limit "
+                      f"({self.scale_buffer_max_windows} windows): only "
+                      f"{len(self.floor_scale_samples)} confident floor sample(s) "
+                      f"collected, needed {self.scale_warmup_windows} in agreement. "
+                      f"Committing the provisional s={self.current_metric_scale:.4f} so "
+                      f"the whole map stays at ONE scale. This run's metric scale is "
+                      f"UNVERIFIED (scale_locked_forced=True).")
             _buffering = (self.scale_buffer_enabled and not self._scale_committed
                           and len(self._pending_batches) < self.scale_buffer_max_windows)
             if _buffering and len(batch_poses) > 0:
