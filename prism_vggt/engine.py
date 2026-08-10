@@ -21,6 +21,44 @@ from .utils.geometry import (
 from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
 
+
+def _rel_spread(vals) -> float:
+    """Relative disagreement in a set of scale estimates: max/min - 1.
+
+    0.0 means every estimate agrees. Used as the gate on committing the metric scale:
+    a set of floor-derived scales that disagree by more than a few percent is telling
+    you the floor RANSAC has not converged, and their median is not a measurement.
+    """
+    v = [float(x) for x in vals if x is not None and float(x) > 0]
+    if len(v) < 2:
+        return 0.0
+    return max(v) / min(v) - 1.0
+
+
+def _tightest_cluster(vals, k: int):
+    """Return (median, members) of the k contiguous sorted samples with least spread.
+
+    Preferred over a plain median once the samples are known to disagree: with samples
+    [0.46, 0.72, 0.73, 0.74] the median (0.725) is fine, but with [0.46, 0.47, 0.73]
+    the median (0.47) and the tightest cluster agree — and with the 3-sample case that
+    poisoned apartment_1 ([0.4649, 0.7272, ~0.5]) the raw median picked a value no
+    individual measurement supported. The cluster at least corresponds to a set of
+    observations that agreed with each other.
+    """
+    v = sorted(float(x) for x in vals if x is not None and float(x) > 0)
+    if not v:
+        return 1.0, []
+    k = max(2, min(int(k), len(v)))
+    best_i, best_spread = 0, float("inf")
+    for i in range(0, len(v) - k + 1):
+        sp = _rel_spread(v[i:i + k])
+        if sp < best_spread:
+            best_i, best_spread = i, sp
+    members = v[best_i:best_i + k]
+    import numpy as _np
+    return float(_np.median(members)), members
+
+
 class StreamingWindowEngine:
     def __init__(self, perception: BasePerceptionExtractor, voxel_size: float = 0.02,
                  max_depth: float = 4.5, face_size: int = 512, crop_margin: int = 24,
@@ -262,6 +300,41 @@ class StreamingWindowEngine:
         self.scale_warmup_windows = int(os.environ.get("SCALE_WARMUP_WINDOWS", "3"))
         self.floor_scale_samples = []
         self._scale_committed = False
+
+        # ── Scale-lock CONSISTENCY gate + pre-lock BUFFER (2026-08-10) ────────
+        # The warm-up above committed the median of the first `scale_warmup_windows`
+        # confident floor estimates, with "confident" meaning conf >= 0.4. On the
+        # 2026-08-09 matrix that was not nearly strict enough. apartment_1 collected
+        # samples of 0.4649 and 0.7272 — a 56% disagreement, i.e. an estimator that has
+        # plainly not converged — took their median 0.5056, locked it, and the map came
+        # out 31% off metric scale (`metric_scale_error_pct` 31.3 on smooth, 53.7 on
+        # loop) even though that run had the BEST trajectory of any method on the scene
+        # (ATE 0.84 m vs 1.9-2.2 m). The geometry was right; only its size was wrong.
+        #
+        # Two additions:
+        #  * consistency — refuse to commit while the samples disagree by more than
+        #    `scale_lock_max_spread`; keep collecting up to `scale_warmup_max_windows`,
+        #    then commit to the TIGHTEST CLUSTER rather than the raw median, so one
+        #    outlier cannot drag the locked value.
+        #  * a higher bar for a *scale* sample than for leveling: a floor good enough to
+        #    tell you which way is up is not necessarily good enough to set metric size.
+        self.scale_warmup_max_windows = int(os.environ.get("SCALE_WARMUP_MAX_WINDOWS", "8"))
+        self.scale_lock_max_spread = float(os.environ.get("SCALE_LOCK_MAX_SPREAD", "0.15"))
+        self.scale_lock_min_confidence = float(
+            os.environ.get("SCALE_LOCK_MIN_CONF", "0.50"))
+        # Windows integrated BEFORE the lock kept their provisional scale forever —
+        # nothing ever went back and resized them — so a map could contain slabs at two
+        # different sizes (visible as duplicated, offset floors in the apartment_1
+        # snapshots). Buffer pre-lock windows and integrate them once, at the locked
+        # scale. Set PRISM_SCALE_BUFFER=0 to restore the old streaming-from-frame-0
+        # behaviour (and the artifact).
+        self.scale_buffer_enabled = os.environ.get("PRISM_SCALE_BUFFER", "1") == "1"
+        self._pending_batches = []      # [(depths, rgbs, masks, poses)]
+        self._pending_frames = 0
+        self._integrated_any = False    # has anything reached the TSDF yet?
+        self._provisional_scale = None  # ONE scale for every pre-lock window
+        self.scale_buffer_max_windows = int(
+            os.environ.get("SCALE_BUFFER_MAX_WINDOWS", "6"))
         # Reset-boundary scale RETUNE (drift-correction; default OFF). Once committed, the
         # metric scale is normally frozen (LOCK_SCALE_AFTER_FIRST). With this on, at each
         # RESET rebuild — and only if the floor is re-observed with confidence ≥ min_conf —
@@ -287,6 +360,65 @@ class StreamingWindowEngine:
         self._acc_kf_depths = []
         self._acc_kf_masks = []
         self._acc_kf_poses = []
+
+    def _rescale_world_by(self, k: float):
+        """Multiply every length in the accumulated world by ``k``.
+
+        Valid ONLY while nothing has been integrated into the TSDF: it is a global
+        similarity about the world origin, so it changes the map's size and leaves its
+        shape, all rotations and every relative pose untouched. Used at scale-lock time
+        to resize the buffered warm-up windows from the provisional scale to the locked
+        one, which is what stops the map containing the same room at two sizes.
+        """
+        k = float(k)
+        for idx, (d, rgb, m, poses) in enumerate(self._pending_batches):
+            self._pending_batches[idx] = (
+                [dd * k for dd in d], rgb, m,
+                [self._scaled_pose(pp, k) for pp in poses])
+        self.trajectory = [np.asarray(t) * k for t in self.trajectory]
+        self.full_poses = [self._scaled_pose(p, k) for p in self.full_poses]
+        self.prev_overlap_global_poses = [
+            self._scaled_pose(p, k) for p in self.prev_overlap_global_poses]
+        if getattr(self, "world_align", None) is not None:
+            self.world_align = self.world_align.copy()
+            self.world_align[:3, 3] *= k
+        if getattr(self, "prev_overlap_world_pts", None):
+            self.prev_overlap_world_pts = [
+                np.asarray(P) * k for P in self.prev_overlap_world_pts]
+        # The reset/extract-last path keeps its own copy of the keyframes for the final
+        # colour pass; resize those too or the colouring runs against stale geometry.
+        if getattr(self, "_acc_kf_depths", None):
+            self._acc_kf_depths = [d * k for d in self._acc_kf_depths]
+        if getattr(self, "_acc_kf_poses", None):
+            self._acc_kf_poses = [self._scaled_pose(p, k) for p in self._acc_kf_poses]
+
+    @staticmethod
+    def _scaled_pose(pose, k: float):
+        out = np.asarray(pose).copy()
+        out[:3, 3] = out[:3, 3] * float(k)
+        return out
+
+    def _flush_pending_batches(self, s_locked: float):
+        """Integrate the buffered warm-up windows as ONE batch, then clear the buffer.
+
+        Called when the scale commits (or when the buffer cap is hit). The batches were
+        already resized by _rescale_world_by, so no per-batch factor is applied here —
+        submitting them as a single job keeps ``self.tsdf_future`` meaningful, since
+        several back-to-back submits would leave only the last one waitable.
+        """
+        if not self._pending_batches:
+            return
+        d, rgb, m, poses = [], [], [], []
+        for bd, brgb, bm, bp in self._pending_batches:
+            d.extend(bd); rgb.extend(brgb); m.extend(bm); poses.extend(bp)
+        n_win = len(self._pending_batches)
+        self._pending_batches = []
+        self._pending_frames = 0
+        print(f"  > [Scale Buffer] flushing {len(poses)} buffered keyframes from "
+              f"{n_win} window(s) at locked s={s_locked:.4f}")
+        self._integrated_any = True
+        self.tsdf_future = self.tsdf_executor.submit(
+            self._async_tsdf_task, d, rgb, m, poses)
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         for j in range(len(poses)):
@@ -816,8 +948,12 @@ class StreamingWindowEngine:
                     s_est = self.current_metric_scale
 
                 # Collect confident floor estimates until the scale is committed.
+                # NOTE the threshold is scale_lock_min_confidence (0.50), NOT
+                # level_min_confidence (0.40). Setting the metric SIZE of the map needs a
+                # better floor than deciding which way is up: the apartment_1 sample that
+                # poisoned the 2026-08-09 lock passed at 0.4.
                 if (not self._scale_committed and floor_scale is not None
-                        and floor_conf >= self.level_min_confidence):
+                        and floor_conf >= self.scale_lock_min_confidence):
                     self.floor_scale_samples.append(float(floor_scale))
 
                 if not self._scale_committed and len(self.floor_scale_samples) > 0:
@@ -827,11 +963,61 @@ class StreamingWindowEngine:
                     # leaves the cameras and the geometry at different scales → the
                     # live-viewer ghosting/drift). The Umeyama rotation is
                     # scale-independent, so only the placement scale changes here.
-                    s_anchor = float(np.median(self.floor_scale_samples))
-                    if len(self.floor_scale_samples) >= self.scale_warmup_windows:
+                    # Hold ONE provisional scale for every pre-lock window. The old code
+                    # re-anchored to the running median each window, so windows 1..3 went
+                    # into the map at DIFFERENT scales and no single factor could ever
+                    # reconcile them afterwards. With a fixed provisional scale the whole
+                    # pre-lock world is internally consistent, and committing is then just
+                    # one global similarity (see _rescale_world_by).
+                    s_anchor = float(self._provisional_scale
+                                     if self._provisional_scale is not None
+                                     else np.median(self.floor_scale_samples))
+                    _n = len(self.floor_scale_samples)
+                    _spread = _rel_spread(self.floor_scale_samples)
+                    _enough = _n >= self.scale_warmup_windows
+                    _agree = _spread <= self.scale_lock_max_spread
+                    _forced = _n >= self.scale_warmup_max_windows
+                    if _enough and (_agree or _forced):
+                        # Commit to the tightest consistent cluster, not the raw median.
+                        s_lock, used = _tightest_cluster(
+                            self.floor_scale_samples,
+                            max(3, self.scale_warmup_windows))
+                        # Retroactively resize the pre-lock world to the locked scale.
+                        # Only legitimate while NOTHING has been integrated yet — once
+                        # geometry is in the TSDF it cannot be resized, so if the buffer
+                        # was disabled or overflowed we keep the provisional scale for
+                        # what is already there and say so.
+                        _k = float(s_lock) / float(s_anchor) if s_anchor else 1.0
+                        if abs(_k - 1.0) > 1e-6:
+                            if not self._integrated_any:
+                                self._rescale_world_by(_k)
+                                print(f"  > [Scale Lock] resized the buffered world by "
+                                      f"x{_k:.4f} (provisional {s_anchor:.4f} -> "
+                                      f"locked {float(s_lock):.4f})")
+                            else:
+                                print(f"  > [Scale Lock] WARNING: {self._pending_frames} "
+                                      f"frame(s) were already integrated at the "
+                                      f"provisional scale {s_anchor:.4f}; they stay at "
+                                      f"that size while the rest of the map uses "
+                                      f"{float(s_lock):.4f} (x{_k:.4f} mismatch). Raise "
+                                      f"SCALE_BUFFER_MAX_WINDOWS to avoid this.")
+                        s_anchor = float(s_lock)
                         self._scale_committed = True
-                        print(f"  > [Scale Lock] committed median s={s_anchor:.4f} "
-                              f"over {len(self.floor_scale_samples)} windows")
+                        print(f"  > [Scale Lock] committed s={s_anchor:.4f} from "
+                              f"{len(used)}/{_n} samples "
+                              f"(spread {100*_spread:.0f}%, cluster "
+                              f"{100*_rel_spread(used):.0f}%)"
+                              + ("  [FORCED at the warm-up cap — the floor estimator "
+                                 "never converged on this scene; treat this run's "
+                                 "metric scale as unreliable]" if _forced and not _agree
+                                 else ""))
+                        print(f"  > [Scale Lock] samples: "
+                              f"{[round(x,4) for x in self.floor_scale_samples]}")
+                    elif _enough and not _agree:
+                        print(f"  > [Scale Warmup] {_n} samples but they disagree by "
+                              f"{100*_spread:.0f}% (> {100*self.scale_lock_max_spread:.0f}%) "
+                              f"— NOT locking yet, collecting up to "
+                              f"{self.scale_warmup_max_windows}")
                     else:
                         # floor_scale is None whenever THIS window saw no confident
                         # floor (estimate_metric_scale_from_floor returns (None, conf,
@@ -908,6 +1094,10 @@ class StreamingWindowEngine:
                         print("  > [SL4] overlap fit degenerate — Sim3 fallback this submap")
 
             self.current_metric_scale = s_anchor
+            if self._provisional_scale is None and not self._scale_committed:
+                # First window's anchor becomes THE provisional scale for the whole
+                # warm-up, so every pre-lock window shares one metric.
+                self._provisional_scale = float(s_anchor)
 
             # ── per-submap anchor diagnostics ───────────────────────────────
             # Watch these across submaps to localise the online "cloning" drift:
@@ -987,7 +1177,21 @@ class StreamingWindowEngine:
                 _c_metric = floor_plane["centroid"] * self.current_metric_scale
                 _floor_z = float((global_poses[mid_idx] @ np.append(_c_metric, 1.0))[2])
                 _gain = float(os.environ.get("PRISM_Z_RELEVEL_GAIN", "0.1"))
-                _dz = -_gain * _floor_z
+                # SANITY CLAMP. This nudge assumes the detected plane IS the floor, and
+                # the floor is by construction near world Z=0. A plane reported 3.2 m
+                # above Z=0 is a ceiling or a tabletop, not a floor — on apartment_1 the
+                # 2026-08-09 run took floors at +3.17 m, +3.27 m and +2.03 m and shifted
+                # whole windows vertically by up to 0.32 m each, which is a large part of
+                # why that map came out as stacked, offset slabs. Beyond this distance we
+                # do not believe the detection and leave the anchor alone.
+                _max_off = float(os.environ.get("PRISM_Z_RELEVEL_MAX_M", "0.5"))
+                if abs(_floor_z) > _max_off:
+                    print(f"  > [ZReLevel] REJECTED: plane at {_floor_z:+.3f}m is "
+                          f"> {_max_off:.2f}m from Z=0 (conf={floor_conf:.2f}) — not a "
+                          f"floor; leaving the anchor unchanged")
+                    _dz = 0.0
+                else:
+                    _dz = -_gain * _floor_z
                 if abs(_dz) > 1e-5:
                     t_anchor[2] += _dz
                     if self.align_mode == "sl4" and self._H_current is not None:
@@ -1150,11 +1354,42 @@ class StreamingWindowEngine:
                 self._acc_kf_poses.extend(batch_poses)
 
             t3 = time.time()
-            if len(batch_poses) > 0:
-                print(f"  > [TSDF] Sending {len(batch_poses)} Keyframes to C++ Background Mapper...")
-                self.tsdf_future = self.tsdf_executor.submit(
-                    self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
-                )
+            # ── Pre-lock BUFFER ───────────────────────────────────────────────
+            # Until the metric scale is committed, every window is integrated at a
+            # PROVISIONAL scale, and nothing ever resized it afterwards. On apartment_1
+            # windows 1-3 went into the TSDF at s = 0.4649, 0.5898 and then the lock
+            # settled at 0.5109 — a map holding the same room at three sizes, which is
+            # what the duplicated offset floor slabs in the snapshots are.
+            #
+            # Hold pre-lock windows instead, and integrate them once the scale is known,
+            # rescaled by k = s_locked / s_used. Rescaling by a single factor is exact:
+            # depths and pose translations are both lengths in the same world frame, so
+            # multiplying both by k is a global similarity about the world origin and
+            # leaves rotations and the geometry's shape untouched.
+            #
+            # Cost: the map appears after the lock instead of after window 1 (a startup
+            # latency of at most scale_buffer_max_windows windows). That is a real,
+            # reportable property of the deployed engine, not a benchmark artifact.
+            _buffering = (self.scale_buffer_enabled and not self._scale_committed
+                          and len(self._pending_batches) < self.scale_buffer_max_windows)
+            if _buffering and len(batch_poses) > 0:
+                self._pending_batches.append(
+                    (batch_depths, batch_rgbs, batch_masks, batch_poses,
+                     float(self.current_metric_scale)))
+                self._pending_frames += len(batch_poses)
+                print(f"  > [Scale Buffer] holding {len(batch_poses)} keyframes "
+                      f"({self._pending_frames} total over "
+                      f"{len(self._pending_batches)} window(s)) until the metric scale "
+                      f"is locked")
+            else:
+                if self._pending_batches:
+                    self._flush_pending_batches(float(self.current_metric_scale))
+                if len(batch_poses) > 0:
+                    print(f"  > [TSDF] Sending {len(batch_poses)} Keyframes to C++ Background Mapper...")
+                    self._integrated_any = True
+                    self.tsdf_future = self.tsdf_executor.submit(
+                        self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
+                    )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
             # Wait for the background mapper, then pull the geometry. The point cloud
@@ -1358,6 +1593,20 @@ class StreamingWindowEngine:
                 self._done_starts.add(i)   # partial tail windows re-run when extended
 
             yield display_mesh, display_pcd, np.array(self.trajectory), self.last_floor_plane
+
+        # The sequence can end while the scale never met the lock criteria (a short
+        # sequence, or a scene where the floor estimator never converged). Those windows
+        # are still in the buffer, and without this flush the run would finish with an
+        # EMPTY map — a far worse failure than an imperfect scale. Integrate them at the
+        # best scale we have and say plainly that it was never locked.
+        if self._pending_batches:
+            print(f"  > [Scale Buffer] sequence ended with the metric scale NOT locked "
+                  f"({len(self.floor_scale_samples)} confident floor sample(s), needed "
+                  f"{self.scale_warmup_windows} in agreement) — flushing "
+                  f"{self._pending_frames} buffered keyframes at the provisional "
+                  f"s={self.current_metric_scale:.4f}. This run's metric scale is "
+                  f"UNVERIFIED; scale_locked=False is recorded for it.")
+            self._flush_pending_batches(float(self.current_metric_scale))
 
         if self.tsdf_future is not None:
             self.tsdf_future.result()
