@@ -383,8 +383,14 @@ class StreamingWindowEngine:
         """
         k = float(k)
         for idx, (d, rgb, m, poses) in enumerate(self._pending_batches):
+            # Preserve dtype: depth maps come out of np.linalg.norm as float32 and are
+            # handed straight to nvblox. `dd * k` with a Python float would promote them
+            # to float64 and change what the C++ integrator receives.
             self._pending_batches[idx] = (
-                [dd * k for dd in d], rgb, m,
+                [np.asarray(dd) * np.asarray(k, dtype=np.asarray(dd).dtype)
+                 if np.asarray(dd).dtype.kind == "f" else np.asarray(dd) * k
+                 for dd in d],
+                rgb, m,
                 [self._scaled_pose(pp, k) for pp in poses])
         self.trajectory = [np.asarray(t) * k for t in self.trajectory]
         self.full_poses = [self._scaled_pose(p, k) for p in self.full_poses]
@@ -1422,9 +1428,17 @@ class StreamingWindowEngine:
             _buffering = (self.scale_buffer_enabled and not self._scale_committed
                           and len(self._pending_batches) < self.scale_buffer_max_windows)
             if _buffering and len(batch_poses) > 0:
+                # FOUR elements, matching _rescale_world_by and
+                # _flush_pending_batches. This used to append the per-batch scale as a
+                # fifth, from an earlier design where each pre-lock window kept its own
+                # scale; when that became a single provisional scale the field was
+                # redundant, and both unpackers were updated while the append was not.
+                # Result: `ValueError: too many values to unpack (expected 4)` the moment
+                # the scale locked, which in the live server killed the engine on every
+                # reset and left the viewer with poses but no point cloud (nvblox TSDF
+                # Blocks: 0 forever).
                 self._pending_batches.append(
-                    (batch_depths, batch_rgbs, batch_masks, batch_poses,
-                     float(self.current_metric_scale)))
+                    (batch_depths, batch_rgbs, batch_masks, batch_poses))
                 self._pending_frames += len(batch_poses)
                 print(f"  > [Scale Buffer] holding {len(batch_poses)} keyframes "
                       f"({self._pending_frames} total over "
