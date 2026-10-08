@@ -17,6 +17,7 @@ from .coloring import BlockColorCache
 from .utils.geometry import (
     register_camera_poses_sim3, register_camera_poses_kabsch, rotation_aligning_vectors,
     register_points_sl4, apply_sl4, sl4_local_sim3, sl4_nonsimilarity_report,
+    register_points_sim3_robust,
 )
 from .utils.metricfication import estimate_metric_scale_from_floor
 from .utils.profiler import VRAMProfiler
@@ -251,26 +252,57 @@ class StreamingWindowEngine:
 
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
-        self.prev_overlap_world_pts = []   # dense tail world pts (SL4 fit source)
+        # Dense tail-overlap world points of the previous window, one entry per overlap
+        # frame: (pts (N,3) world metres, radial (N,) metric range from that camera),
+        # sampled on the align_stride pixel grid so they are pixel-corresponded with
+        # the next window's head frames. Source of every dense alignment fit.
+        self.prev_overlap_world_pts = []
 
         # --- Submap ALIGNMENT GROUP (ablation knob) --------------------------
         # How each new submap is registered into the world, read fresh each reset so
-        # a per-run env var takes effect:
-        #   "sl4" (default) — 15-DoF projective homography fit from the DENSE overlap
-        #                      point maps (VGGT-SLAM's group). Integrated at its local
-        #                      similarity (nvblox is rigid); the discarded shear/
-        #                      perspective is reported as the non-similarity distortion.
-        #                      Chosen as default: best reconstruction on the preliminary
-        #                      benchmark (F 0.66 vs 0.60 for sim3); floor grounding keeps
-        #                      it metric. Set PRISM_ALIGN=sim3 for the metric-by-
-        #                      construction 7-DoF variant, or se3 for 6-DoF rigid.
-        #   "sim3"           — 7-DoF similarity (rot + trans + one scale).
-        #   "se3"            — 6-DoF rigid (rot + trans) at the LOCKED metric scale.
+        # a per-run env var takes effect. prism-v2: every group is now fit from the SAME
+        # dense, pixel-corresponded overlap point maps, so the ablation changes only the
+        # group (before, Sim(3)/SE(3) saw 4 camera centres while SL(4) saw ~3000 dense
+        # points — the comparison was data vs data as much as group vs group).
+        #   "sl4" (default) — 15-DoF projective homography (VGGT-SLAM's group), robust
+        #                      (trimmed) DLT, integrated at its local similarity; falls
+        #                      back to dense Sim(3) when its distortion exceeds
+        #                      PRISM_SL4_MAX_NONSIM percent.
+        #   "sim3"           — 7-DoF similarity, robust IRLS Umeyama on the dense
+        #                      overlap points. Scale per PRISM_SCALE_MODE (below).
+        #   "se3"            — 6-DoF rigid at the metric scale (dense fit, scale fixed).
+        #   "sim3_cam"/"se3_cam" — the ORIGINAL camera-centre fits (4 overlap camera
+        #                      centres + axes), kept so old results stay reproducible.
         self.align_mode = os.environ.get("PRISM_ALIGN", "sl4").lower()
+        if self.align_mode not in ("sl4", "sim3", "se3", "sim3_cam", "se3_cam"):
+            print(f"[Engine] WARNING: unknown PRISM_ALIGN={self.align_mode!r} -> sl4")
+            self.align_mode = "sl4"
+        self.align_dense = not self.align_mode.endswith("_cam")
+        # Scale after the metric lock. "free": every window keeps the scale its dense
+        # overlap fit measures (a true Sim(3); SL(4) always behaves like this through
+        # its local scale). "lock": freeze the committed metric scale and estimate only
+        # rotation + translation (the old LOCK_SCALE_AFTER_FIRST behaviour, which
+        # silently turned the "Sim(3)" arm into SE(3)). se3 is always locked; the legacy
+        # *_cam modes keep honouring LOCK_SCALE_AFTER_FIRST.
+        _sm = os.environ.get("PRISM_SCALE_MODE", "free").lower()
+        if self.align_mode == "se3":
+            self.scale_lock_after_commit = True
+        elif self.align_dense:
+            self.scale_lock_after_commit = (_sm == "lock")
+        else:
+            self.scale_lock_after_commit = os.environ.get("LOCK_SCALE_AFTER_FIRST", "1") == "1"
+        # Dense-correspondence sampling: keep every Nth pixel in each image axis of the
+        # overlap point maps (4 -> ~33k points per 518x1036 frame).
+        self.align_stride = max(1, int(os.environ.get("PRISM_ALIGN_STRIDE", "4")))
+        self.sl4_max_nonsim = float(os.environ.get("PRISM_SL4_MAX_NONSIM", "25"))
+        self.dense_min_inlier_frac = float(os.environ.get("PRISM_DENSE_MIN_INLIERS", "0.35"))
         self._H_current = None
         self.align_stats = {"nonsim_pct": []}
+        # Per-window alignment/guard record (see get_alignment_report()).
+        self.align_log = []
         print(f"[Engine] Submap alignment group = {self.align_mode.upper()} "
-              f"(default sl4; PRISM_ALIGN=sim3|se3 for the ablation variants)")
+              f"({'dense overlap points' if self.align_dense else 'overlap camera centres'}; "
+              f"scale {'locked' if self.scale_lock_after_commit else 'free'} after commit)")
 
         self.trajectory = []
         self.full_poses = []
@@ -299,6 +331,12 @@ class StreamingWindowEngine:
         # SCALE_WARMUP_WINDOWS=1 to restore the old lock-on-first-window behaviour.
         self.scale_warmup_windows = int(os.environ.get("SCALE_WARMUP_WINDOWS", "3"))
         self.floor_scale_samples = []
+        # prism-v2: what the lock actually commits is the WORLD->METRIC correction
+        # ratio floor_scale / placement_scale of each window. With one fixed provisional
+        # placement scale (the old behaviour) this is just floor_scale up to a constant,
+        # so the lock is unchanged; with a free per-window (dense Sim(3)/SL(4)) scale it
+        # is the only quantity that is comparable across windows.
+        self._scale_ratio_samples = []
         self._scale_committed = False
 
         # ── Scale-lock CONSISTENCY gate + pre-lock BUFFER (2026-08-10) ────────
@@ -363,6 +401,20 @@ class StreamingWindowEngine:
         self.world_align = np.eye(4)
         self.is_leveled = False
         self.last_floor_plane = None
+        # prism-v2: HOW the world got levelled — "floor" (a confident floor plane on the
+        # first window), "gravity_prior" (no confident floor: the upright camera's own
+        # down axis), "floor_deferred" (prior later replaced by the first confident
+        # floor, before anything reached the TSDF), or None (never levelled). Before
+        # this, a first window whose MIDDLE frame had floor_conf < 0.4 left the world
+        # in the camera frame for the whole run (Z = camera forward) — 30 of 60 PRISM
+        # runs on 2026-08-10 — and every Z-up guard then acted on a horizontal axis.
+        self.level_source = None
+        self.level_prior_enabled = os.environ.get("PRISM_LEVEL_PRIOR", "1") == "1"
+        self.level_refine_enabled = os.environ.get("PRISM_LEVEL_REFINE", "1") == "1"
+        self.guard_stats = {"upside_down_skipped": 0, "upside_down_flipped": 0,
+                            "flip_corrections": 0, "zrelevel_applied": 0,
+                            "zrelevel_rejected": 0, "dense_fallbacks": 0,
+                            "sl4_rejected": 0}
 
         # Keyframes integrated so far this reconstruction, accumulated across windows so
         # the single final extract (reset_extract_last_only) can colour the whole surface
@@ -401,7 +453,8 @@ class StreamingWindowEngine:
             self.world_align[:3, 3] *= k
         if getattr(self, "prev_overlap_world_pts", None):
             self.prev_overlap_world_pts = [
-                np.asarray(P) * k for P in self.prev_overlap_world_pts]
+                (np.asarray(P) * k, np.asarray(rad) * k)
+                for P, rad in self.prev_overlap_world_pts]
         # The reset/extract-last path keeps its own copy of the keyframes for the final
         # colour pass; resize those too or the colouring runs against stale geometry.
         if getattr(self, "_acc_kf_depths", None):
@@ -414,6 +467,102 @@ class StreamingWindowEngine:
         out = np.asarray(pose).copy()
         out[:3, 3] = out[:3, 3] * float(k)
         return out
+
+    def _transform_world_rigid(self, T: np.ndarray):
+        """Apply a rigid world transform ``T`` (4x4) to everything placed so far.
+
+        Like _rescale_world_by, only legitimate while NOTHING has been integrated into
+        the TSDF (the buffered pre-lock windows are transformed with the rest). Used by
+        the deferred levelling refinement: the gravity-prior world is re-levelled to the
+        first confident floor without the map ever holding two orientations.
+        """
+        T = np.asarray(T, dtype=np.float64)
+        R, t = T[:3, :3], T[:3, 3]
+        tp = lambda P: T @ np.asarray(P)
+        self._pending_batches = [(d, rgb, m, [tp(pp) for pp in poses])
+                                 for (d, rgb, m, poses) in self._pending_batches]
+        self.trajectory = [R @ np.asarray(x) + t for x in self.trajectory]
+        self.full_poses = [tp(p) for p in self.full_poses]
+        self.prev_overlap_global_poses = [tp(p) for p in self.prev_overlap_global_poses]
+        self.world_align = T @ self.world_align
+        if self.prev_overlap_world_pts:
+            self.prev_overlap_world_pts = [((np.asarray(P) @ R.T) + t, rad)
+                                           for P, rad in self.prev_overlap_world_pts]
+        if self._acc_kf_poses:
+            self._acc_kf_poses = [tp(p) for p in self._acc_kf_poses]
+        if self._last_kf_pose is not None:
+            self._last_kf_pose = tp(self._last_kf_pose)
+
+    # ── Dense overlap correspondences (prism-v2) ──────────────────────────
+    def _grid(self, arr):
+        """Subsample an (H,W,...) per-pixel map on the alignment stride grid."""
+        a = np.asarray(arr)
+        st = self.align_stride
+        return a[::st, ::st] if a.ndim >= 2 else a
+
+    def _cache_tail_world_pts(self, pts_list, global_poses, frame_scales, win_len):
+        """Cache the tail-overlap frames' points in WORLD metres (stride grid) so the
+        next window can register its head frames against them pixel-for-pixel."""
+        self.prev_overlap_world_pts = []
+        for oj in range(win_len - self.overlap, win_len):
+            P = self._grid(pts_list[oj]).reshape(-1, 3).astype(np.float64) * frame_scales[oj]
+            rad = np.linalg.norm(P, axis=1)
+            gp = global_poses[oj]
+            self.prev_overlap_world_pts.append(((P @ gp[:3, :3].T) + gp[:3, 3], rad))
+
+    def _overlap_correspondences(self, canonical_native, pts_list, masks, s_guess):
+        """Pixel-corresponded (src native-world, tgt world-metres, weight) triplets
+        from this window's head overlap frames vs the previous window's tail.
+
+        Points are dropped when non-finite, masked out, closer than 0.3 m or farther
+        than 1.5x max_depth in EITHER submap (s_guess converts native to metres for the
+        test). Weights favour near points, whose PanoVGGT depth is most reliable.
+        Returns (src, tgt, w) or None."""
+        prev = self.prev_overlap_world_pts
+        if not prev or len(prev) != self.overlap:
+            return None
+        far = 1.5 * float(self.max_depth)
+        src_l, tgt_l, w_l = [], [], []
+        for k in range(self.overlap):
+            cur = self._grid(pts_list[k]).reshape(-1, 3).astype(np.float64)
+            tw, trad = prev[k]
+            n = min(len(cur), len(tw))
+            if n == 0:
+                continue
+            cur, tw, trad = cur[:n], tw[:n], trad[:n]
+            crad = np.linalg.norm(cur, axis=1) * float(s_guess)
+            ok = (np.isfinite(cur).all(1) & np.isfinite(tw).all(1)
+                  & (crad > 0.3) & (crad < far) & (trad > 0.3) & (trad < far))
+            m = masks[k] if masks is not None and k < len(masks) else None
+            if m is not None:
+                mg = self._grid(m)
+                if mg.shape[:2] == self._grid(pts_list[k]).shape[:2]:
+                    ok &= (mg.reshape(-1)[:n] > 0)
+            if not ok.any():
+                continue
+            cn = canonical_native[k]
+            src_l.append((cur[ok] @ cn[:3, :3].T) + cn[:3, 3])     # native-world
+            tgt_l.append(tw[ok])
+            w_l.append(1.0 / (1.0 + 0.5 * trad[ok]))
+        if not src_l:
+            return None
+        return (np.concatenate(src_l), np.concatenate(tgt_l), np.concatenate(w_l))
+
+    def get_alignment_report(self) -> Dict[str, Any]:
+        """Summary of how every window was aligned and which guards fired."""
+        log = self.align_log
+        src = {}
+        for e in log:
+            src[e.get("fit")] = src.get(e.get("fit"), 0) + 1
+        rm = [e["dense_rmse"] for e in log if e.get("dense_rmse") is not None]
+        return {"align_mode": self.align_mode, "dense": self.align_dense,
+                "scale_lock_after_commit": self.scale_lock_after_commit,
+                "level_source": self.level_source, "n_windows": len(log),
+                "fit_sources": src, "guards": dict(self.guard_stats),
+                "dense_rmse_median_m": (float(np.median(rm)) if rm else None),
+                "sl4_nonsim_pct_median": (float(np.median(self.align_stats["nonsim_pct"]))
+                                          if self.align_stats["nonsim_pct"] else None),
+                "windows": log}
 
     def _flush_pending_batches(self, s_locked: float):
         """Integrate the buffered warm-up windows as ONE batch, then clear the buffer.
@@ -462,11 +611,33 @@ class StreamingWindowEngine:
         preds = self.perception.process_sequence([f.image for f in window])
         preds["_infer_time"] = time.time() - t
         self._perc_misses += 1
+        self._maybe_dump_perception(window, preds)
         if cache is not None and key is not None:
             cache[key] = {k: v for k, v in preds.items() if k != "_infer_time"}
             while len(cache) > self._perc_cache_max:
                 cache.popitem(last=False)
         return preds
+
+    def _maybe_dump_perception(self, window, preds):
+        """PRISM_PERC_DUMP=<dir>: save each window's network output (points on a
+        PRISM_PERC_DUMP_STRIDE grid, float16) so alignment / levelling / scale variants
+        can be replayed on CPU without re-running PanoVGGT. Best effort, never fatal."""
+        out_dir = os.environ.get("PRISM_PERC_DUMP")
+        if not out_dir:
+            return
+        try:
+            st = max(1, int(os.environ.get("PRISM_PERC_DUMP_STRIDE", "4")))
+            os.makedirs(out_dir, exist_ok=True)
+            ts = np.asarray([float(getattr(f, "timestamp", i)) for i, f in enumerate(window)])
+            pts = np.stack([np.asarray(p)[::st, ::st] for p in preds["points"]]).astype(np.float16)
+            np.savez_compressed(
+                os.path.join(out_dir, f"win_{ts[0]:012.3f}.npz"),
+                timestamps=ts, stride=st,
+                heights=np.asarray([float(f.camera_height) for f in window]),
+                poses=np.stack([np.asarray(p) for p in preds["poses"]]).astype(np.float32),
+                points=pts)
+        except Exception as e:  # pragma: no cover
+            print(f"[Engine] perception dump failed: {e}")
 
     # --- Point-cloud streaming API (delegated to the BlockColorCache) ------- #
     def get_map_version(self) -> int:
@@ -625,31 +796,14 @@ class StreamingWindowEngine:
         free, _ = torch.cuda.mem_get_info()
         return free / (1024 ** 3)
 
-    def _fit_sl4_from_overlap(self, canonical_native, pts_list):
-        """Fit the 15-DoF SL(4) homography (native-world -> world) from the DENSE,
-        pixel-corresponded overlap point maps: the current window's first ``overlap``
-        frames vs the previous window's cached tail world points (same physical
-        frames). Returns H or None (caller falls back to Sim3). This is the honest
-        analog of VGGT-SLAM's dense projective submap alignment — many points, so all
-        15 DoF are well constrained (fitting from ~4 camera centres would not be)."""
-        prev = self.prev_overlap_world_pts
-        if not prev or len(prev) != self.overlap:
+    def _fit_sl4_from_overlap(self, corr):
+        """Fit the 15-DoF SL(4) homography (native-world -> world) from the dense,
+        pixel-corresponded overlap correspondences (see _overlap_correspondences).
+        Returns H or None (caller falls back to dense Sim3)."""
+        if corr is None:
             return None
-        src_list, tgt_list = [], []
-        for k in range(self.overlap):
-            cur = np.asarray(pts_list[k]).reshape(-1, 3)
-            tw = np.asarray(prev[k]).reshape(-1, 3)
-            n = min(len(cur), len(tw))
-            if n == 0:
-                continue
-            cn = canonical_native[k]
-            src_w = (cur[:n] @ cn[:3, :3].T) + cn[:3, 3]      # native-world
-            src_list.append(src_w)
-            tgt_list.append(tw[:n])                            # world (meters)
-        if not src_list:
-            return None
-        return register_points_sl4(np.concatenate(src_list, axis=0),
-                                   np.concatenate(tgt_list, axis=0))
+        src, tgt, _w = corr
+        return register_points_sl4(src, tgt, max_pts=5000)
 
     def _color_geometry(self, geometry, rgbs=None, depths=None, masks=None, poses=None):
         """Colorize an already-extracted volume mesh in place (vertices = point
@@ -830,6 +984,8 @@ class StreamingWindowEngine:
             window_masks = [f.mask for f in window]
             window_heights = [f.camera_height for f in window]
             window_timestamps = [f.timestamp for f in window]
+            win_log = {"fit": "first" if self.is_first_window else None, "submap": int(self.submap_count), "start": int(i),
+                       "mode": self.align_mode}
 
             # ── Still-frame guard ──────────────────────────────────────────────
             # Zero camera motion => no parallax => VGGT's near-ground depth is
@@ -911,51 +1067,91 @@ class StreamingWindowEngine:
                 # the MEDIAN floor scale across several frames of this first window
                 # (one-time cost) rather than the mid frame alone.
                 first_scales = []
+                best_plane = None          # (conf, frame_idx, plane) for levelling
                 for fi in sorted(set([0, mid_idx, win_len // 4,
                                       3 * win_len // 4, win_len - 1])):
                     if 0 <= fi < win_len:
-                        fs, fc, _fp = estimate_metric_scale_from_floor(
-                            pts_list[fi], target_camera_height=window_heights[fi])
+                        if fi == mid_idx:
+                            fs, fc, _fp = floor_scale, floor_conf, floor_plane
+                        else:
+                            fs, fc, _fp = estimate_metric_scale_from_floor(
+                                pts_list[fi], target_camera_height=window_heights[fi])
                         if fs is not None and fc >= self.level_min_confidence:
                             first_scales.append(float(fs))
+                            if _fp is not None and (best_plane is None or fc > best_plane[0]):
+                                best_plane = (float(fc), fi, _fp)
                 if first_scales:
                     s_anchor = float(np.median(first_scales))
                     self.floor_scale_samples.append(s_anchor)
+                    self._scale_ratio_samples.append(1.0)   # placed AT the floor scale
                     if floor_scale is not None:
                         floor_scale = s_anchor   # keep leveling consistent with anchor
                 elif floor_scale is not None:
                     s_anchor = floor_scale
                     if floor_conf >= self.level_min_confidence:
                         self.floor_scale_samples.append(float(floor_scale))
+                        self._scale_ratio_samples.append(1.0)
                 else:
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
                     s_anchor = (3.0 / np.median(valid_depths)) if len(valid_depths) > 0 else 1.0
 
-                # Gravity leveling (one-time, first confident floor): rotate so the
-                # floor normal points to world +Z, then translate so the floor is at
-                # Z=0. Baked into the anchor; later windows inherit it via the chain.
-                if not self.is_leveled and floor_plane is not None and floor_conf >= self.level_min_confidence:
-                    n_canonical = canonical_native[mid_idx][:3, :3] @ floor_plane["normal"]
+                # Gravity leveling (one-time): rotate so "up" becomes world +Z, then
+                # translate so the floor is at Z=0. Baked into the anchor; later windows
+                # inherit it via the chain.
+                #
+                # prism-v2: the floor may come from ANY of the sampled frames (the most
+                # confident one), not only the middle frame. If no frame has a confident
+                # floor, fall back to the GRAVITY PRIOR — the camera is mounted upright
+                # (robot stick / benchmark rig), so the mean of the window's camera
+                # "up" axes (-Y in OpenCV) is a good estimate of world up. Without this
+                # fallback the world silently stayed in camera-0's frame for the whole
+                # run, Z-up guards acted on a horizontal axis, and the upside-down guard
+                # flipped frames at random. The prior is refined to the first confident
+                # floor later, while the pre-lock buffer still holds the map.
+                if not self.is_leveled and best_plane is not None:
+                    _fc, _fi, _plane = best_plane
+                    n_canonical = canonical_native[_fi][:3, :3] @ _plane["normal"]
                     R_level = rotation_aligning_vectors(n_canonical, np.array([0.0, 0.0, 1.0]))
                     self.world_align = np.eye(4)
                     self.world_align[:3, :3] = R_level
                     if self.world_frame == "floor":
                         # Translate so the detected floor sits on Z=0.
-                        c_can = (canonical_native[mid_idx] @ np.append(floor_plane["centroid"], 1.0))[:3]
+                        c_can = (canonical_native[_fi] @ np.append(_plane["centroid"], 1.0))[:3]
                         floor_z = float((R_level @ (s_anchor * c_can))[2])
                         self.world_align[2, 3] = -floor_z
                     self.is_leveled = True
-                    print(f"  > [Leveling] Z-up world ({self.world_frame} origin) "
-                          f"(conf={floor_conf:.2f}).")
+                    self.level_source = "floor"
+                    print(f"  > [Leveling] Z-up world ({self.world_frame} origin) from "
+                          f"frame {_fi} floor (conf={_fc:.2f}).")
+                elif not self.is_leveled and self.level_prior_enabled:
+                    up = np.zeros(3)
+                    for cn in canonical_native:
+                        up += cn[:3, :3] @ np.array([0.0, -1.0, 0.0])
+                    if np.linalg.norm(up) > 1e-6:
+                        R_level = rotation_aligning_vectors(up, np.array([0.0, 0.0, 1.0]))
+                        self.world_align = np.eye(4)
+                        self.world_align[:3, :3] = R_level
+                        if self.world_frame == "floor":
+                            # No floor seen: put camera 0 at its known height above Z=0.
+                            self.world_align[2, 3] = float(window_heights[0])
+                        self.is_leveled = True
+                        self.level_source = "gravity_prior"
+                        print("  > [Leveling] no confident floor in the first window -> "
+                              "GRAVITY PRIOR (upright camera); will refine to the first "
+                              "confident floor before integration.")
+                elif not self.is_leveled:
+                    print("  > [Leveling] WARNING: no confident floor and the gravity "
+                          "prior is disabled — world stays in the camera frame; Z-up "
+                          "guards are OFF for this run.")
 
                 R_anchor = self.world_align[:3, :3].copy()
                 t_anchor = self.world_align[:3, 3].copy()
             else:
-                # Jointly estimate scale + rotation + translation from the overlap
-                # cameras (proper Sim3). The world is already metric (inherited through
-                # the chain), so the Umeyama scale lands directly in meters - no
-                # damping / clamp heuristics needed.
+                self._H_current = None
+                # ── 1) Camera-centre Sim(3) (the ORIGINAL fit) ───────────────────
+                # Always computed: it IS the alignment for the legacy *_cam modes and
+                # the fallback for the dense modes when the overlap points are unusable.
                 src_cam_np = np.stack(canonical_native[:self.overlap])
                 tgt_cam_np = np.stack(self.prev_overlap_global_poses)
                 s_est, R_anchor, t_anchor, src_ctr, tgt_ctr = register_camera_poses_sim3(src_cam_np, tgt_cam_np)
@@ -963,110 +1159,109 @@ class StreamingWindowEngine:
                     # Degenerate baseline (camera barely moved across the overlap):
                     # keep the previous metric scale rather than inventing one.
                     s_est = self.current_metric_scale
+                s_meas = s_est
+                win_log["fit"] = "cam"
 
-                # Collect confident floor estimates until the scale is committed.
-                # NOTE the threshold is scale_lock_min_confidence (0.50), NOT
-                # level_min_confidence (0.40). Setting the metric SIZE of the map needs a
-                # better floor than deciding which way is up: the apartment_1 sample that
-                # poisoned the 2026-08-09 lock passed at 0.4.
-                if (not self._scale_committed and floor_scale is not None
-                        and floor_conf >= self.scale_lock_min_confidence):
-                    self.floor_scale_samples.append(float(floor_scale))
-
-                if not self._scale_committed and len(self.floor_scale_samples) > 0:
-                    # SCALE WARM-UP: re-anchor to the running MEDIAN of the first few
-                    # confident floor estimates instead of trusting window 0 alone, so
-                    # one bad first-window estimate can't inflate the whole map (which
-                    # leaves the cameras and the geometry at different scales → the
-                    # live-viewer ghosting/drift). The Umeyama rotation is
-                    # scale-independent, so only the placement scale changes here.
-                    # Hold ONE provisional scale for every pre-lock window. The old code
-                    # re-anchored to the running median each window, so windows 1..3 went
-                    # into the map at DIFFERENT scales and no single factor could ever
-                    # reconcile them afterwards. With a fixed provisional scale the whole
-                    # pre-lock world is internally consistent, and committing is then just
-                    # one global similarity (see _rescale_world_by).
-                    s_anchor = float(self._provisional_scale
-                                     if self._provisional_scale is not None
-                                     else np.median(self.floor_scale_samples))
-                    _n = len(self.floor_scale_samples)
-                    _spread = _rel_spread(self.floor_scale_samples)
-                    _enough = _n >= self.scale_warmup_windows
-                    _agree = _spread <= self.scale_lock_max_spread
-                    _forced = _n >= self.scale_warmup_max_windows
-                    if _enough and (_agree or _forced):
-                        # Commit to the tightest consistent cluster, not the raw median.
-                        s_lock, used = _tightest_cluster(
-                            self.floor_scale_samples,
-                            max(3, self.scale_warmup_windows))
-                        # Retroactively resize the pre-lock world to the locked scale.
-                        # Only legitimate while NOTHING has been integrated yet — once
-                        # geometry is in the TSDF it cannot be resized, so if the buffer
-                        # was disabled or overflowed we keep the provisional scale for
-                        # what is already there and say so.
-                        _k = float(s_lock) / float(s_anchor) if s_anchor else 1.0
-                        if abs(_k - 1.0) > 1e-6:
-                            if not self._integrated_any:
-                                self._rescale_world_by(_k)
-                                print(f"  > [Scale Lock] resized the buffered world by "
-                                      f"x{_k:.4f} (provisional {s_anchor:.4f} -> "
-                                      f"locked {float(s_lock):.4f})")
-                            else:
-                                print(f"  > [Scale Lock] WARNING: {self._pending_frames} "
-                                      f"frame(s) were already integrated at the "
-                                      f"provisional scale {s_anchor:.4f}; they stay at "
-                                      f"that size while the rest of the map uses "
-                                      f"{float(s_lock):.4f} (x{_k:.4f} mismatch). Raise "
-                                      f"SCALE_BUFFER_MAX_WINDOWS to avoid this.")
-                        s_anchor = float(s_lock)
-                        self._scale_committed = True
-                        print(f"  > [Scale Lock] committed s={s_anchor:.4f} from "
-                              f"{len(used)}/{_n} samples "
-                              f"(spread {100*_spread:.0f}%, cluster "
-                              f"{100*_rel_spread(used):.0f}%)"
-                              + ("  [FORCED at the warm-up cap — the floor estimator "
-                                 "never converged on this scene; treat this run's "
-                                 "metric scale as unreliable]" if _forced and not _agree
-                                 else ""))
-                        print(f"  > [Scale Lock] samples: "
-                              f"{[round(x,4) for x in self.floor_scale_samples]}")
-                    elif _enough and not _agree:
-                        print(f"  > [Scale Warmup] {_n} samples but they disagree by "
-                              f"{100*_spread:.0f}% (> {100*self.scale_lock_max_spread:.0f}%) "
-                              f"— NOT locking yet, collecting up to "
-                              f"{self.scale_warmup_max_windows}")
+                # ── 2) Dense Sim(3) from the overlap point maps (prism-v2) ────────
+                # Same pixel-corresponded points the SL(4) arm uses, robust IRLS.
+                corr = None
+                dense = None
+                if self.align_dense:
+                    corr = self._overlap_correspondences(
+                        canonical_native, pts_list, window_masks,
+                        s_guess=self.current_metric_scale)
+                    if corr is not None:
+                        dense = register_points_sim3_robust(corr[0], corr[1], weights=corr[2])
+                    if dense is not None and dense["inlier_frac"] >= self.dense_min_inlier_frac:
+                        s_meas, R_anchor = dense["s"], dense["R"]
+                        src_ctr, tgt_ctr = dense["src_ctr"], dense["tgt_ctr"]
+                        win_log.update(fit="dense", dense_rmse=dense["rmse"],
+                                       dense_inliers=dense["inlier_frac"], n_corr=dense["n"],
+                                       s_dense=dense["s"], s_cam=float(s_est))
                     else:
-                        # floor_scale is None whenever THIS window saw no confident
-                        # floor (estimate_metric_scale_from_floor returns (None, conf,
-                        # None) in 4 branches). The sample-append above is guarded, and
-                        # s_anchor correctly falls back to the median of earlier
-                        # samples -- but this diagnostic string was not guarded, so
-                        # formatting None with :.4f raised TypeError and killed the
-                        # whole run from a LOG LINE. Reaching it needs: scale not yet
-                        # committed, >=1 sample already collected, and no floor this
-                        # window -- which is why it only bites mid-sequence on longer
-                        # runs, and is the most likely cause of the 43 zero-output
-                        # PRISM runs in the 2026-07 matrix.
-                        _fs = ("n/a (no floor this window)" if floor_scale is None
-                               else f"{floor_scale:.4f}")
-                        print(f"  > [Scale Warmup] {len(self.floor_scale_samples)}/"
-                              f"{self.scale_warmup_windows}: median s={s_anchor:.4f} "
-                              f"(this floor s={_fs})")
-                elif os.environ.get("LOCK_SCALE_AFTER_FIRST", "1") == "1":
-                    # Committed: every later window REUSES the locked scale and estimates
-                    # only rotation+translation from the overlap. Leaving the overlap
-                    # Sim3 free re-estimates scale each submap; even a ~1% drift
-                    # compounds → the map inflates and submaps no longer fuse in the TSDF
-                    # (ghosting/cloning + unbounded point growth). Set
-                    # LOCK_SCALE_AFTER_FIRST=0 to restore the free-Sim3 behaviour.
+                        self.guard_stats["dense_fallbacks"] += 1
+                        win_log["fit"] = "cam_fallback"
+                        print(f"  > [Align] dense overlap fit unusable "
+                              f"({'no correspondences' if corr is None else 'too few inliers'})"
+                              f" — camera-centre fallback this submap")
+
+                # ── 3) Metric scale: warm-up / lock / free ───────────────────────
+                # What gets committed is the world->metric RATIO (floor scale over the
+                # scale this window was placed at); see _scale_ratio_samples.
+                lock_after = self.scale_lock_after_commit
+                place_free = self.align_dense and not lock_after
+                k_applied = 1.0
+                if not self._scale_committed:
+                    if place_free:
+                        s_used = float(s_meas)
+                    elif self._provisional_scale is not None:
+                        s_used = float(self._provisional_scale)
+                    elif lock_after:
+                        s_used = float(self.current_metric_scale)
+                    else:
+                        s_used = float(np.clip(s_est, 0.1, 5.0))
+
+                    # Collect confident floor estimates until the scale is committed.
+                    # Setting the metric SIZE of the map needs a better floor than
+                    # deciding which way is up (scale_lock_min_confidence).
+                    if floor_scale is not None and floor_conf >= self.scale_lock_min_confidence:
+                        self.floor_scale_samples.append(float(floor_scale))
+                        self._scale_ratio_samples.append(float(floor_scale) / s_used)
+
+                    if self._scale_ratio_samples:
+                        _r = self._scale_ratio_samples
+                        _n = len(_r)
+                        _spread = _rel_spread(_r)
+                        _enough = _n >= self.scale_warmup_windows
+                        _agree = _spread <= self.scale_lock_max_spread
+                        _forced = _n >= self.scale_warmup_max_windows
+                        if _enough and (_agree or _forced):
+                            # Commit to the tightest consistent cluster, not the raw median.
+                            k_lock, used = _tightest_cluster(_r, max(3, self.scale_warmup_windows))
+                            # Retroactively resize the pre-lock world. Only legitimate
+                            # while NOTHING has been integrated yet.
+                            if abs(k_lock - 1.0) > 1e-6:
+                                if not self._integrated_any:
+                                    self._rescale_world_by(k_lock)
+                                    k_applied = float(k_lock)
+                                    print(f"  > [Scale Lock] resized the buffered world by "
+                                          f"x{k_lock:.4f}")
+                                else:
+                                    print(f"  > [Scale Lock] WARNING: {self._pending_frames} "
+                                          f"frame(s) were already integrated at the "
+                                          f"pre-lock scale; they stay at that size while the "
+                                          f"rest of the map is x{k_lock:.4f}. Raise "
+                                          f"SCALE_BUFFER_MAX_WINDOWS to avoid this.")
+                            s_used = s_used * float(k_lock)
+                            self._scale_committed = True
+                            print(f"  > [Scale Lock] committed s={s_used:.4f} "
+                                  f"(world x{k_lock:.4f}) from {len(used)}/{_n} samples "
+                                  f"(spread {100*_spread:.0f}%, cluster "
+                                  f"{100*_rel_spread(used):.0f}%)"
+                                  + ("  [FORCED at the warm-up cap — the floor estimator "
+                                     "never converged on this scene; treat this run's "
+                                     "metric scale as unreliable]" if _forced and not _agree
+                                     else ""))
+                            print(f"  > [Scale Lock] floor samples: "
+                                  f"{[round(x,4) for x in self.floor_scale_samples]}")
+                        elif _enough and not _agree:
+                            print(f"  > [Scale Warmup] {_n} samples but they disagree by "
+                                  f"{100*_spread:.0f}% (> {100*self.scale_lock_max_spread:.0f}%) "
+                                  f"— NOT locking yet, collecting up to "
+                                  f"{self.scale_warmup_max_windows}")
+                        else:
+                            _fs = ("n/a (no floor this window)" if floor_scale is None
+                                   else f"{floor_scale:.4f}")
+                            print(f"  > [Scale Warmup] {_n}/{self.scale_warmup_windows}: "
+                                  f"placement s={s_used:.4f} (this floor s={_fs})")
+                    s_anchor = s_used
+                elif lock_after:
+                    # Committed + locked: reuse the locked scale, estimate only R + t.
                     s_anchor = self.current_metric_scale
                     # OPTIONAL slow drift-correction (default OFF): on a RESET rebuild, if
                     # the floor is re-observed confidently, nudge the locked scale toward
-                    # the fresh floor estimate ONCE per batch by a small gain. Reset-only +
-                    # confidence-gated + small gain avoids the per-submap compounding the
-                    # free-Sim3 path (below) suffers. Otherwise we keep the locked (VGGT)
-                    # scale untouched — a low-confidence floor never perturbs it.
-                    if (self._reset_rescale and self._scale_committed and reset
+                    # the fresh floor estimate ONCE per batch by a small gain.
+                    if (self._reset_rescale and reset
                             and not did_reset_rescale and floor_scale is not None
                             and floor_conf >= self._reset_rescale_min_conf):
                         g = self._reset_rescale_gain
@@ -1077,36 +1272,71 @@ class StreamingWindowEngine:
                         print(f"  > [Scale Retune] reset floor conf={floor_conf:.2f}: "
                               f"s {self.current_metric_scale:.4f} → {s_anchor:.4f} "
                               f"(gain {g})")
+                elif self.align_dense:
+                    # Committed + free: the dense overlap fit carries the scale. The
+                    # factor legitimately changes from window to window (PanoVGGT
+                    # normalises each window's scene scale), so it is NOT compared with
+                    # the previous window. A gross fit failure is caught by the inlier
+                    # gate above (camera-centre fallback); the camera-centre scale is
+                    # logged as an independent cross-check.
+                    s_anchor = float(s_meas)
+                    if win_log.get("fit") == "dense" and s_est > 0:
+                        win_log["scale_xcheck"] = float(s_meas) / float(s_est)
                 else:
+                    # Legacy free camera-centre Sim3 (LOCK_SCALE_AFTER_FIRST=0).
                     if (os.environ.get("SCALE_TRACK_FLOOR", "0") == "1"
                             and floor_scale is not None and floor_conf > 0.4):
                         s_est = 0.9 * s_est + 0.1 * floor_scale
                     s_anchor = float(np.clip(s_est, 0.1, 5.0))
+
+                # The overlap targets were measured BEFORE a lock-time world rescale;
+                # bring them into the rescaled world. (The original code skipped this,
+                # so the lock window was placed (k-1)*|tgt| off and the overlap pin then
+                # snapped back — a visible jump exactly at the scale lock.)
+                if k_applied != 1.0:
+                    tgt_ctr = np.asarray(tgt_ctr) * k_applied
+                    if corr is not None:
+                        corr = (corr[0], corr[1] * k_applied, corr[2])
+                    tgt_cam_np = np.stack(self.prev_overlap_global_poses)
+
+                # When the placement scale differs from what the dense fit measured
+                # (locked, held, or rescaled), refit R/t at that fixed scale so rotation
+                # and translation are optimal for the scale actually used.
+                if (win_log.get("fit") == "dense" and corr is not None
+                        and abs(s_anchor - float(s_meas)) > 1e-9 * max(1.0, abs(s_anchor))):
+                    d2 = register_points_sim3_robust(corr[0], corr[1], weights=corr[2],
+                                                     fixed_scale=s_anchor)
+                    if d2 is not None:
+                        R_anchor, src_ctr, tgt_ctr = d2["R"], d2["src_ctr"], d2["tgt_ctr"]
+                        win_log["dense_rmse"] = d2["rmse"]
                 # Keep translation consistent with the (locked or estimated) scale.
                 t_anchor = tgt_ctr - s_anchor * (R_anchor @ src_ctr)
+                win_log["s"] = float(s_anchor)
 
-                # ── Alignment-group ABLATION (PRISM_ALIGN) ────────────────────
-                # Default 'sim3' uses the joint 7-DoF similarity computed above.
-                # 'se3' drops the per-overlap scale → 6-DoF rigid placement at the
-                # locked metric scale. 'sl4' fits the full 15-DoF projective homography
-                # from the DENSE overlap point maps (VGGT-SLAM's group); _to_world then
-                # places poses through the exact homography, integrating at its local
-                # similarity. The Sim3 (s_anchor,R_anchor,t_anchor) is kept as the guard
-                # base + fallback.
-                self._H_current = None
-                if self.align_mode == "se3":
+                # ── 4) Alignment-group specifics ─────────────────────────────────
+                if self.align_mode == "se3_cam":
                     R_anchor, t_anchor = register_camera_poses_kabsch(
                         src_cam_np, tgt_cam_np, scale=s_anchor)
                 elif self.align_mode == "sl4":
-                    H_sl4 = self._fit_sl4_from_overlap(canonical_native, pts_list)
+                    H_sl4 = self._fit_sl4_from_overlap(corr)
                     if H_sl4 is not None:
-                        self._H_current = H_sl4
                         rep = sl4_nonsimilarity_report(
                             H_sl4, at=canonical_native[mid_idx][:3, 3])
                         self.align_stats["nonsim_pct"].append(rep["nonsimilarity_pct"])
-                        print(f"  > [SL4] non-similarity {rep['nonsimilarity_pct']:.1f}% "
-                              f"(anisotropy {rep['anisotropy']:.3f}, "
-                              f"perspective {rep['perspective']:.3e})")
+                        win_log["sl4_nonsim_pct"] = float(rep["nonsimilarity_pct"])
+                        if rep["nonsimilarity_pct"] > self.sl4_max_nonsim:
+                            # A homography this far from a similarity is a bad fit, not
+                            # geometry: integrating it warps the map. Use dense Sim(3).
+                            self.guard_stats["sl4_rejected"] += 1
+                            win_log["fit"] = "sl4_rejected->sim3"
+                            print(f"  > [SL4] non-similarity {rep['nonsimilarity_pct']:.1f}% "
+                                  f"> {self.sl4_max_nonsim:.0f}% — rejected, dense Sim3 this submap")
+                        else:
+                            self._H_current = H_sl4
+                            win_log["fit"] = "sl4"
+                            print(f"  > [SL4] non-similarity {rep['nonsimilarity_pct']:.1f}% "
+                                  f"(anisotropy {rep['anisotropy']:.3f}, "
+                                  f"perspective {rep['perspective']:.3e})")
                     else:
                         print("  > [SL4] overlap fit degenerate — Sim3 fallback this submap")
 
@@ -1168,6 +1398,7 @@ class StreamingWindowEngine:
                 flip_deg = float(np.degrees(np.arccos(
                     np.clip((np.trace(R_fix) - 1.0) / 2.0, -1.0, 1.0))))
                 gate = float(os.environ.get("PRISM_FLIP_GATE_DEG", "35"))
+                win_log["overlap_rot_deg"] = flip_deg
                 if flip_deg > gate:
                     R_anchor = R_fix @ R_anchor
                     Ua, _, Vta = np.linalg.svd(R_anchor)      # re-orthonormalize
@@ -1175,23 +1406,70 @@ class StreamingWindowEngine:
                     t_anchor = tgt_ctr - s_anchor * (R_anchor @ src_ctr)
                     if self.align_mode == "sl4" and self._H_current is not None:
                         # A rigid world-space pre-rotation composes with a homography by
-                        # left-multiplication (its last row is [0,0,0,1]).
+                        # left-multiplication (its last row is [0,0,0,1]). prism-v2: rotate
+                        # about the OVERLAP centroid, as the Sim3 branch above effectively
+                        # does. Rotating about the world ORIGIN (the original code) moved
+                        # the submap by |R_fix - I| x its distance from the origin — metres
+                        # for a 40-degree fix 10 m out — the SL4 'teleport' glitch.
+                        _p = np.asarray(tgt_ctr, dtype=np.float64)
                         Tfix = np.eye(4); Tfix[:3, :3] = R_fix
+                        Tfix[:3, 3] = _p - R_fix @ _p
                         self._H_current = Tfix @ self._H_current
                     global_poses = [_to_world(cn) for cn in canonical_native]
+                    self.guard_stats["flip_corrections"] += 1
+                    win_log["flip_fixed"] = True
                     print(f"  > [FlipGuard] corrected {flip_deg:.0f} deg world-frame "
                           f"flip (overlap-orientation lock)")
+
+            # ── Deferred levelling refinement (prism-v2) ───────────────────────
+            # The gravity prior (no confident floor on the first window) is replaced by
+            # the first confident floor — ONCE, and only while nothing has reached the
+            # TSDF yet, so the map never holds two orientations. The rotation pivots on
+            # the current camera, so the local map does not swing.
+            if (not self.is_first_window and self.level_source == "gravity_prior"
+                    and self.level_refine_enabled and not self._integrated_any
+                    and floor_plane is not None and floor_conf >= self.level_min_confidence):
+                _s_mid = self.current_metric_scale
+                if self.align_mode == "sl4" and self._H_current is not None:
+                    _s_mid = sl4_local_sim3(self._H_current, canonical_native[mid_idx][:3, 3])[0]
+                _gm = global_poses[mid_idx]
+                n_w = _gm[:3, :3] @ floor_plane["normal"]
+                R_c = rotation_aligning_vectors(n_w, np.array([0.0, 0.0, 1.0]))
+                _p = _gm[:3, 3]
+                T_lv = np.eye(4); T_lv[:3, :3] = R_c; T_lv[:3, 3] = _p - R_c @ _p
+                if self.world_frame == "floor":
+                    _cw = T_lv @ (_gm @ np.append(floor_plane["centroid"] * _s_mid, 1.0))
+                    T_lv[2, 3] -= float(_cw[2])
+                _ang = float(np.degrees(np.arccos(np.clip((np.trace(R_c) - 1.0) / 2.0, -1.0, 1.0))))
+                self._transform_world_rigid(T_lv)
+                R_anchor = R_c @ R_anchor
+                t_anchor = R_c @ t_anchor + T_lv[:3, 3]
+                tgt_ctr = (T_lv @ np.append(np.asarray(tgt_ctr, dtype=np.float64), 1.0))[:3]
+                if self.align_mode == "sl4" and self._H_current is not None:
+                    self._H_current = T_lv @ self._H_current
+                global_poses = [_to_world(cn) for cn in canonical_native]
+                self.level_source = "floor_deferred"
+                win_log["level_refined_deg"] = _ang
+                print(f"  > [Leveling] refined gravity prior to the floor "
+                      f"(conf={floor_conf:.2f}): {_ang:.2f} deg, floor -> Z=0")
 
             # ── Vertical drift guard (Z re-level) ──────────────────────────────
             # Gently re-level the anchor so the detected floor stays at world Z=0 each
             # submap, countering the slow per-submap floor CLIMB (t_z creep) that makes
             # the robot appear to sink into the map over time. Small gain so a noisy
             # floor estimate can't jitter the map. Disable with PRISM_Z_RELEVEL=0.
+            # prism-v2: only in a LEVELLED world — otherwise "Z" is a horizontal axis
+            # and the nudge drags the map sideways. Under SL(4) the floor centroid is
+            # scaled by the homography's local scale at the mid camera.
             if (not self.is_first_window
+                    and self.is_leveled
                     and os.environ.get("PRISM_Z_RELEVEL", "1") == "1"
                     and floor_plane is not None
                     and floor_conf >= self.level_min_confidence):
-                _c_metric = floor_plane["centroid"] * self.current_metric_scale
+                _s_mid = self.current_metric_scale
+                if self.align_mode == "sl4" and self._H_current is not None:
+                    _s_mid = sl4_local_sim3(self._H_current, canonical_native[mid_idx][:3, 3])[0]
+                _c_metric = floor_plane["centroid"] * _s_mid
                 _floor_z = float((global_poses[mid_idx] @ np.append(_c_metric, 1.0))[2])
                 _gain = float(os.environ.get("PRISM_Z_RELEVEL_GAIN", "0.1"))
                 # IS THIS PLANE ACTUALLY THE FLOOR?
@@ -1223,12 +1501,15 @@ class StreamingWindowEngine:
                           f"(conf={floor_conf:.2f}) — that is not the floor; anchor "
                           f"unchanged")
                     _dz = 0.0
+                    self.guard_stats["zrelevel_rejected"] += 1
                 else:
                     # Genuine vertical drift: correct it, gently, and cap the per-window
                     # step so one noisy estimate cannot jump the map.
                     _max_step = float(os.environ.get("PRISM_Z_RELEVEL_MAX_STEP_M", "0.15"))
                     _dz = float(np.clip(-_gain * _floor_z, -_max_step, _max_step))
                 if abs(_dz) > 1e-5:
+                    self.guard_stats["zrelevel_applied"] += 1
+                    win_log["zrelevel_dz"] = _dz
                     t_anchor[2] += _dz
                     if self.align_mode == "sl4" and self._H_current is not None:
                         Tdz = np.eye(4); Tdz[2, 3] = _dz
@@ -1325,14 +1606,34 @@ class StreamingWindowEngine:
                     # Integrate only if the camera moved enough vs the last keyframe.
                     # Pose bookkeeping above stays unconditional so the trajectory and
                     # pose-correction chain are intact even on skipped frames.
-                    if (not is_still) and self._keyframe_accept(global_pose, window_timestamps[j]):
-                        tsdf_pose = global_pose.copy()
-
+                    _integrate = (not is_still) and self._keyframe_accept(
+                        global_pose, window_timestamps[j])
+                    tsdf_pose = global_pose.copy()
+                    if _integrate:
                         # Cubemap upside-down guard. The camera's down axis (col 1,
-                        # image +Y) should point toward world -Z; if it points +Z the
-                        # camera is flipped, so rotate 180 deg about its X.
-                        if tsdf_pose[2, 1] > 0:
+                        # image +Y) should point toward world -Z.
+                        #
+                        # prism-v2: the original guard ROTATED the frame 180 deg about
+                        # its X whenever that axis had any +Z component, for the TSDF
+                        # only (the trajectory kept the unrotated pose). In a world that
+                        # was never levelled (the old first-window bug) the down axis is
+                        # horizontal, its Z component is noise around 0, and the guard
+                        # flipped frames at random — integrating mirrored depth. Now:
+                        #   skip (default) — in a levelled world, a camera whose down axis
+                        #                    points clearly UP (> +0.5) is a broken pose:
+                        #                    do not integrate it; never act unlevelled.
+                        #   flip           — the original behaviour.
+                        #   off            — no guard.
+                        _ug = os.environ.get("PRISM_UPSIDE_GUARD", "skip").lower()
+                        if _ug == "flip" and tsdf_pose[2, 1] > 0:
                             tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                            self.guard_stats["upside_down_flipped"] += 1
+                        elif _ug == "skip" and self.is_leveled and tsdf_pose[2, 1] > 0.5:
+                            self.guard_stats["upside_down_skipped"] += 1
+                            _integrate = False
+                            print(f"  > [UpsideDown] frame {i + j}: camera down axis points "
+                                  f"up (z={tsdf_pose[2, 1]:+.2f}) — not integrated")
+                    if _integrate:
 
                         # Under SL(4) the native->world map is projective, so its
                         # LOCAL scale varies per camera; integrate each frame's depth at
@@ -1363,19 +1664,20 @@ class StreamingWindowEngine:
                     self.prev_overlap_global_poses.append(global_pose)
             
             self.prev_overlap_raw_pts = pts_list[-self.overlap:]
-            # For the SL(4) arm, cache the tail overlap frames' WORLD points (at the
-            # scale they were integrated) so the NEXT window can fit its homography from
-            # dense metric correspondences. Only built for sl4 (sim3/se3 pay nothing).
-            if self.align_mode == "sl4":
-                self.prev_overlap_world_pts = []
-                for oj in range(win_len - self.overlap, win_len):
-                    if self._H_current is not None:
-                        ws = sl4_local_sim3(self._H_current, canonical_native[oj][:3, 3])[0]
+            # Cache the tail overlap frames' WORLD points (at the scale they were
+            # integrated) so the NEXT window can fit its alignment from dense metric
+            # correspondences. prism-v2: built for every dense mode, not only SL(4).
+            if self.align_dense:
+                _fs = []
+                for oj in range(win_len):
+                    if self.align_mode == "sl4" and self._H_current is not None and oj >= win_len - self.overlap:
+                        _fs.append(sl4_local_sim3(self._H_current, canonical_native[oj][:3, 3])[0])
                     else:
-                        ws = self.current_metric_scale
-                    P = np.asarray(pts_list[oj]).reshape(-1, 3) * ws
-                    gp = global_poses[oj]
-                    self.prev_overlap_world_pts.append((P @ gp[:3, :3].T) + gp[:3, 3])
+                        _fs.append(depth_scale)
+                self._cache_tail_world_pts(pts_list, global_poses, _fs, win_len)
+            win_log.update(level_source=self.level_source,
+                           scale_committed=bool(self._scale_committed))
+            self.align_log.append(win_log)
             self.is_first_window = False
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
