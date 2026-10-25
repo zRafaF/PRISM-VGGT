@@ -23,9 +23,10 @@ It is the reconstruction core of **VAT** (Volumetric Asynchronous Telepresence),
 
 ## Highlights
 
-- **Panoramic input, 7-DoF alignment.** Pinhole systems such as VGGT-SLAM stitch submaps with a 15-DoF projective (SL(4)) transform because the camera calibration is unknown. A panorama has a fixed, known projection, so a 7-DoF similarity (Sim(3)) is enough. In a study that changes only the alignment group, SL(4) is at best marginally better on open paths and worse on loops, where its scale error grows to 31% against about 20% for Sim(3).
-- **Streaming with bounded memory.** Fixed windows are folded into the volumetric map as they arrive, so GPU memory stays around 15 GB peak (about 7 GB average) regardless of sequence length, while offline batch methods keep growing with every frame.
-- **Metric without a ranging sensor.** Absolute scale comes from a RANSAC floor fit and the known camera height. It is convenient rather than survey-grade: the scale is off by roughly 14% on typical paths and 20% on loops.
+- **Panoramic input, 7-DoF alignment.** Pinhole systems such as VGGT-SLAM stitch submaps with a 15-DoF projective (SL(4)) transform because the camera calibration is unknown. A panorama has a fixed, known projection, so a 7-DoF similarity (Sim(3)) is enough. In an ablation that changes only the alignment group, SL(4) gives similar results (its fits stay within 1% of a similarity), while freezing the scale (SE(3)) is 2-3x worse.
+- **Does not get lost.** On 18 rendered Replica walks it tracks 98-99% of 2 m stretches and stays within 30 cm on all 18, where the pinhole streaming baselines lose track or drift. On a real 285 m walk with lidar ground truth, its local map error is 9 cm against 41-86 cm.
+- **Fixed work per window.** Windows are folded into the volumetric map as they arrive, so inference work per window is fixed and GPU memory follows the mapped volume (13.5-14.9 GB on Replica scenes, 26.6 GB on the 285 m real walk), while offline batch methods keep growing with every frame.
+- **Metric without a ranging sensor.** Absolute scale comes from a RANSAC floor fit and the known camera height. Scale error was 2.0-2.3% on the rendered walks and 1.1% on the real 285 m walk.
 - **Dense, streamable output.** A single TSDF instead of a per-view point map, exposed as a versioned per-block point cloud with content hashes, so a client downloads only what changed. An optional ESDF is available for navigation.
 - **Runs on a real robot.** Deployed on a Unitree Go2-W carrying a RICOH Theta X, streaming to a cloud GPU and fused live at 3 cm voxels.
 
@@ -51,30 +52,29 @@ It is the reconstruction core of **VAT** (Volumetric Asynchronous Telepresence),
 
 ## Results
 
-All numbers are from a first benchmarking campaign on rendered [Replica](https://github.com/facebookresearch/Replica-Dataset) scenes (four large multi-room scenes, two seeds, single RTX PRO 6000). Rendered frames have no sensor noise or motion blur, and every quantitative result below is from rendered data. Treat them as preliminary.
+These results are from the PRISM manuscript (in preparation, October 2026). The benchmark harness is public at [PRISM-benchmarks](https://github.com/zRafaF/PRISM-benchmarks), and all inputs, raw outputs and scores are on [Hugging Face](https://huggingface.co/datasets/DoninhaD/prism-bench-inputs).
 
-**Against the other streaming method.** Reconstruction quality is scored inside a co-visibility mask so a panoramic method is compared fairly against pinhole baselines.
+**Setup.** 18 rendered walks through six [Replica](https://github.com/facebookresearch/Replica-Dataset) scenes (four rooms and two multi-room apartments, three walks each, 0.5 m/s sampled at 2 Hz), and a real 285 m handheld walk from the [360Loc](https://arxiv.org/abs/2311.17389) atrium with lidar ground-truth poses and a reference map fused from its depth maps. Baselines are LASER and VGGT-SLAM 2.0 on a forward pinhole view (and, as a diagnostic, on the same 360 capture as cube faces), with full-batch PanoVGGT and Pi3X for reference. Streaming methods ran on an RTX 5090 (32 GB). Besides trajectory error we measure whether a system gets lost (share of 2 m stretches tracked, and whether it stays within 30 cm after aligning on the first 2 m) and score each map by its own best-fit alignment, globally and tile by tile.
 
-| Method | ATE (cm) ↓ | Masked F-score ↑ | Outliers (%) ↓ | Map (MB) ↓ | Metric | Peak VRAM (GB) ↓ |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: |
-| LASER | 86.8 | 0.35 | 3.4 | **6.1** | no | **8.4** |
-| **PRISM-VGGT** | **68.9** | **0.40** | **2.5** | 20.9 | **yes** | 15.4 |
+| Data | Method | Map acc. (cm) ↓ | Local (cm) ↓ | F@5 cm ↑ | ATE ↓ | Tracked (%) ↑ | Within 30 cm ↑ |
+| --- | --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Rooms (12 walks) | VGGT-SLAM 2.0 | 8.8 | 8.3 | 0.49 | 30.9 cm | 22 | 0/12 |
+| | LASER | 6.0 | 5.5 | 0.69 | 15.0 cm | 85 | 2/12 |
+| | **PRISM** | **1.3** | **1.0** | **0.95** | **1.9 cm** | **99** | **12/12** |
+| Apartments (6 walks) | VGGT-SLAM 2.0 | 19.8 | 19.7 | 0.20 | 166.8 cm | 26 | 0/6 |
+| | LASER | 15.7 | 13.2 | 0.41 | 41.2 cm | 93 | 0/6 |
+| | **PRISM** | **2.4** | **1.8** | **0.86** | **4.7 cm** | **98** | **6/6** |
+| Real atrium (285 m) | VGGT-SLAM 2.0 | 66.1 | 41.5 | 0.00 | 14.4 m | 69 | 0/1 |
+| | LASER | 93.0 | 85.6 | 0.02 | **1.6 m** | **99** | 0/1 |
+| | **PRISM** | **21.4** | **9.4** | **0.12** | 2.0 m | 96 | 0/1 |
 
-PRISM-VGGT uses more memory than LASER because it builds a dense volumetric map rather than a sparse point set. A VGGT-SLAM comparison was also run, but at the benchmark's window size it never built a second submap, so its loop closure had nothing to act on; a corrected re-run is in progress and it is not reported here.
+<sub>Map acc.: median distance to the reference after each map's own best-fit placement. Local: median error after re-aligning 2 m tiles (5 m on the real walk) on their own. F@5 cm: in the region the pinhole camera observed. Tracked: share of 2 m stretches with RMSE below 5 cm and rotation within 5°.</sub>
 
-**Against offline methods.** Offline batch methods are a quality ceiling rather than a fair comparison. The backbone itself, PanoVGGT run offline over all frames, reaches a masked F-score of 0.58; PRISM-VGGT's 0.40 is the cost of streaming and fusing in bounded memory.
-
-**Alignment group** (ATE in cm / scale error in %, lower is better):
-
-| Motion | SL(4) | Sim(3) (ours) | SE(3) |
-| --- | :---: | :---: | :---: |
-| smooth | **44.0** / 10.3 | 46.2 / **10.0** | 46.6 / 10.1 |
-| stop-and-go | **51.9** / **12.1** | 72.3 / 16.0 | 67.4 / 15.0 |
-| loop | 110.5 / 31.4 | 101.9 / 20.3 | **101.2** / **20.1** |
-
-SE(3) is competitive with Sim(3), so scale freedom is not what carries the result. The finding is that the extra projective freedom is unnecessary and, on loops, harmful.
-
-**Speed.** About 3.4 windows/s with a median per-window latency of 1.5 s, which keeps up with a 2.5 Hz capture feed.
+- **Getting lost.** PRISM tracks 98.8% (rooms) and 97.8% (apartments) of 2 m stretches and stays within 30 cm on all 18 rendered walks. VGGT-SLAM 2.0 tracks 22-26% of stretches, and LASER stays within 30 cm on 2 of 18 walks.
+- **Maps.** On the rendered walks PRISM's map error is about 5-7x lower than the streaming baselines', and the gap remains after tile-wise registration, so it is not just a global offset.
+- **Real walk.** Local map error is 9 cm against 41-86 cm, and scale error is 1.1%. Without loop closure the trajectory is not more accurate than LASER's (2.0 vs 1.6 m ATE). It drifts smoothly around the long loop, which bends the far end of the map while leaving it locally intact. With its 4.5 m fusion range PRISM also covers less of the atrium (regional recall 0.51 against 0.78 for full-batch PanoVGGT).
+- **Alignment group.** SL(4) gives similar results (one seed; its fits stay within 1% of a similarity), while freezing the scale (SE(3)) is 2-3x worse. The similarity is sufficient, and the scale must stay free.
+- **Cost.** 5.7 timesteps/s (3.3 including model loading) on an RTX 5090, above the 2 Hz input, with 13.5-14.9 GB peak on Replica and 26.6 GB on the larger atrium map.
 
 ## Gallery
 
@@ -82,7 +82,7 @@ SE(3) is competitive with Sim(3), so scale freedom is not what carries the resul
   <tr>
     <td colspan="2" align="center">
       <img src="assets/qualitative.png" alt="Qualitative comparison on Replica apartment_0" width="100%"><br>
-      <sub>Replica apartment_0, smooth walkthrough at 2 Hz. The VGGT-SLAM panel is from the single-submap run described above and will be replaced after the re-run.</sub>
+      <sub>Replica apartment_0, smooth walkthrough at 2 Hz, from an earlier benchmarking round (its VGGT-SLAM panel is from a single-submap run). Current numbers are in Results.</sub>
     </td>
   </tr>
   <tr>
@@ -127,10 +127,10 @@ SE(3) is competitive with Sim(3), so scale freedom is not what carries the resul
 
 ## Limitations
 
-- Reconstruction quality trails offline batch methods, the price of streaming fixed windows.
-- Metric scale is estimated from a floor fit and a known camera height, not measured.
-- There is no loop closure, so drift is unbounded on long revisiting paths.
-- Quantitative results are from rendered scenes only; the real captures are shown qualitatively, without a reference scan.
+- There is no loop closure yet, so the trajectory drifts on long loops (2.0 m ATE on the 285 m real walk). The map stays locally consistent but bends at the far end. The next step is detecting revisits from overlapping geometry, optimising a Sim(3) graph over windows and warping the fused map.
+- Metric scale comes from a floor fit and a known camera height; the sensitivity to a wrong height has not been measured.
+- Depth was fused only up to 4.5 m in these runs, so in large spaces it maps a corridor around the path.
+- Rendered frames are noise-free and level, and the real result is a single walk, a check of transfer rather than a statistic.
 
 ## Requirements
 
